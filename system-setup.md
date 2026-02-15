@@ -253,6 +253,7 @@ In `input.conf`:
 
 1. Uncomment the three-finger swipe to change workspace setting
 2. Add window resize configuration:
+3. Uncomment natural scrolling and duplicate it in the input block so it works for bluetooth mouse
 
 ```conf
 # Enable window resize by dragging edges (like macOS/Windows)
