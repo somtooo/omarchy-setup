@@ -285,6 +285,7 @@ Enable system suspend feature by following the instructions in the Omarchy setup
 2. Configure cron snapshots for root partition
 3. Recommended schedule: Regular automated snapshots
 
+![Btrfs Snapshot Configuration](btrfs-assistant.png)
 ---
 
 ## Backup Configuration
@@ -294,7 +295,7 @@ Enable system suspend feature by following the instructions in the Omarchy setup
 #### Prerequisites
 
 - Install rclone: `pacman -S rclone`
-- Configure Google Drive remote: `rclone config`
+- Configure Google Drive remote: `rclone config` -  [rclone-gdrive](https://rclone.org/drive/)
 
 #### Setup
 
@@ -378,7 +379,7 @@ systemctl --user start rclone-gdrive.service
 
 ### 20. Fix Maximum Volume (SwayOSD)
 
-If volume is limited to 100% and sounds too quiet with SwayOSD:
+If volume is limited to 100% and sounds too quiet confirm omarchy still uses SwayOSD then:
 
 #### Solution
 
@@ -413,16 +414,6 @@ min_brightness = 5
 # show_percentage = true
 ```
 
----
-
-## Troubleshooting
-
-- For display issues, check `hyprctl monitors` to verify display names
-- For backup issues, verify rclone mount status with `systemctl --user status rclone-gdrive.service`
-- For keyboard issues, check keyd status with `systemctl status keyd`
-
----
-
 ## Additional Resources
 
 - [Hyprland Documentation](https://wiki.hyprland.org/)
@@ -430,5 +421,3 @@ min_brightness = 5
 - [Waybar Documentation](https://github.com/Alexays/Waybar)
 
 ---
-
-*Last Updated: 2026-02-14*
