@@ -264,6 +264,24 @@ general {
 }
 ```
 
+### 14. Add Omarchy Minimize (OmaVeil)
+
+Install the OmaVeil binary from GitHub Releases and place it in `/usr/local/bin` so Hyprland can find it:
+
+```
+/usr/local/bin/omaveil
+```
+
+Add the keybindings to `~/.config/hypr/bindings.conf`:
+
+```conf
+# OmaVeil - window minimizer (omarchy-native minimize using Walker)
+bindd = SUPER, H, Minimize window, exec, omaveil minimize
+bindd = SUPER, I, Browse minimized windows, exec, omaveil restore
+bindd = SUPER, U, Restore last minimized, exec, omaveil restore-last
+bindd = SUPER SHIFT, U, Restore all minimized, exec, omaveil restore-all
+```
+
 ---
 
 ## System Services
