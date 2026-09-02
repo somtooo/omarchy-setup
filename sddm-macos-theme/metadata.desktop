@@ -1,0 +1,7 @@
+[SddmGreeterTheme]
+Name=macOS
+Description=macOS-style login: blurred wallpaper, circular avatar, glassy pill password field
+Author=som2
+Type=sddm-theme
+Version=1.0
+QtVersion=6

@@ -14,10 +14,11 @@ or custom lid-switch instructions from older Omarchy releases.
 4. [Hyprland Display Management](#hyprland-display-management)
 5. [UI Customization](#ui-customization)
 6. [Window Manager Configuration](#window-manager-configuration)
-7. [System Services](#system-services)
-8. [Backup Configuration](#backup-configuration)
-9. [Development Tools](#development-tools)
-10. [Audio Configuration](#audio-configuration)
+7. [Login and Lock Screens](#login-and-lock-screens)
+8. [System Services](#system-services)
+9. [Backup Configuration](#backup-configuration)
+10. [Development Tools](#development-tools)
+11. [Audio Configuration](#audio-configuration)
 
 ---
 
@@ -303,7 +304,25 @@ omaveil show
 omarchy menu keybindings --print
 ```
 
-### 15. Clipboard History
+### 15. Auto-hide the Status Bar
+
+The bar auto-hides via the `quattrobar-autohide` Python script (repo already
+cloned at `~/devcave/quattrobar-autohide`, source:
+https://github.com/somtooo/quattrobar-autohide). It hides the bar when a window
+overlaps it and reveals it when the cursor hits the top screen edge.
+
+```bash
+cd ~/devcave/quattrobar-autohide
+make install   # installs to ~/.local/bin
+```
+
+Then autostart it from `~/.config/hypr/autostart.lua`:
+
+```lua
+o.launch_on_start("quattrobar-autohide")
+```
+
+### 16. Clipboard History
 
 Omarchy 4 includes a native clipboard manager. It records text and image
 history through the running Quickshell session and stores it under
@@ -324,9 +343,32 @@ test -s ~/.local/state/omarchy/clipboard-history.json
 
 ---
 
+## Login and Lock Screens
+
+macOS-style SDDM login theme and lock screen plugin (blurred wallpaper,
+circular avatar, frosted pill password field, big clock on the lock screen).
+Full install/revert instructions and all theme files are in
+[login-and-lock-screens.md](login-and-lock-screens.md).
+
+Quick summary:
+
+```bash
+# SDDM login theme
+pkexec bash -c 'mkdir -p /usr/share/sddm/themes/macos && cp sddm-macos-theme/* /usr/share/sddm/themes/macos/'
+pkexec sed -i 's/^Current=.*/Current=macos/' /etc/sddm.conf.d/10-theme.conf
+
+# Lock screen plugin
+mkdir -p ~/.config/omarchy/plugins/som2.lock ~/.local/share/login-look
+cp lock-screen-plugin/* ~/.config/omarchy/plugins/som2.lock/
+cp sddm-macos-theme/avatar.png ~/.local/share/login-look/
+omarchy plugin enable som2.lock
+```
+
+---
+
 ## System Services
 
-### 16. DisplayLink Driver Setup
+### 17. DisplayLink Driver Setup
 
 If using a DisplayLink dock:
 
@@ -334,7 +376,7 @@ If using a DisplayLink dock:
 2. Install displaylink driver
 3. **Restart the PC after installation**
 
-### 17. Enable Suspend
+### 18. Enable Suspend
 
 Omarchy 4 manages suspend availability through the system menu. Check whether
 the suspend action is enabled with:
@@ -346,7 +388,7 @@ omarchy toggle enabled suspend
 If it is disabled, toggle it with `omarchy toggle suspend`. Do not add a
 separate legacy suspend or hypridle service.
 
-### 18. Setup Btrfs Snapshots
+### 19. Setup Btrfs Snapshots
 
 Omarchy creates Snapper snapshots for system updates. These are separate from
 Pika Backup and can be used for system rollback. Check the existing snapshots
@@ -380,7 +422,7 @@ rollback snapshots are not removed prematurely.
 
 ## Backup Configuration
 
-### 19. Mount Google Drive with rclone
+### 20. Mount Google Drive with rclone
 
 #### Prerequisites
 
@@ -444,7 +486,7 @@ systemctl --user start rclone-gdrive.service
 - `--vfs-cache-mode full` enables full file caching, required for apps like Pika Backup
 - The service auto-starts on login and restarts on failure
 
-### 20. Configure Pika Backup
+### 21. Configure Pika Backup
 
 1. Install **Pika Backup**
 2. Configure backup destination to `/media/gdrive`
@@ -458,7 +500,7 @@ systemctl --user start rclone-gdrive.service
 
 ## Development Tools
 
-### 21. Install Zed Editor
+### 22. Install Zed Editor
 
 1. Install Zed from their official website (not from AUR)
 2. Add the binary installation location to PATH if not already added
@@ -468,7 +510,7 @@ systemctl --user start rclone-gdrive.service
 
 ## Audio Configuration
 
-### 22. Use the Omarchy 4 Audio OSD
+### 23. Use the Omarchy 4 Audio OSD
 
 Omarchy 4 replaced SwayOSD with a Quickshell-based OSD. Do not install or
 configure `swayosd`; the old `max_volume = 150` setting is not supported by
