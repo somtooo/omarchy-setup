@@ -5,7 +5,7 @@ pieces:
 
 1. **SDDM login theme** (`sddm-macos-theme/`) — what you see at boot / after logout
 2. **Lock screen plugin** (`lock-screen-plugin/`) — what you see when you lock (Super+Esc → Lock)
-3. **Plymouth boot splash** (`plymouth-macos-theme/`) — what you see on fresh boot before SDDM (the "Omarchy" logo)
+3. **Plymouth boot splash** (`plymouth-beautiful-theme/`) — what you see on fresh boot before SDDM (replaces the "Omarchy" logo with a glowing orb from your wallpaper)
 4. **Background sync script** (`scripts/sync-login-bg.sh`) — regenerates blurred
    wallpapers for both screens from your current Omarchy wallpaper
 
@@ -19,7 +19,7 @@ Everything here is reversible. Nothing in `/usr/share/omarchy/` is modified.
 |---|---|---|---|
 | Program | Plymouth | SDDM | Omarchy shell (Quickshell) |
 | Theme location | `/usr/share/plymouth/themes/macos/` | `/usr/share/sddm/themes/macos/` | `~/.config/omarchy/plugins/som2.lock/` |
-| Switch config | `plymouth-set-default-theme macos` + `limine-mkinitcpio` | `/etc/sddm.conf.d/10-theme.conf` → `Current=macos` | `omarchy plugin enable som2.lock` |
+| Switch config | `plymouth-set-default-theme beautiful` + `limine-mkinitcpio` | `/etc/sddm.conf.d/10-theme.conf` → `Current=macos` | `omarchy plugin enable som2.lock` |
 | Needs root? | Yes | Yes | No |
 | When you see it | Fresh boot (before SDDM) | Logout / boot if autologin disabled | Lock |
 
@@ -142,60 +142,55 @@ magick input.png -resize 256x256 \
 ## 4. Boot splash (Plymouth)
 
 Omarchy shows a boot splash **before** SDDM. With autologin enabled (the default
-at `/etc/sddm.conf.d/autologin.conf`), you never see SDDM on fresh boot — you
-see Plymouth, which is why the stock "Omarchy" logo appears even after the
-SDDM theme is changed.
+at `/etc/sddm.conf.d/autologin.conf`), SDDM is skipped on fresh boot — the
+password prompt you see is **Plymouth asking for the disk-encryption password**
+(the disk is encrypted, so this prompt always appears). That is why the stock
+"Omarchy" logo showed even after the SDDM theme was changed.
 
-`plymouth-macos-theme/` is a clean replacement: no logo, blurred wallpaper
-background dimmed to 55%, keeps the disk-encryption password prompt.
+`plymouth-beautiful-theme/` replaces it: stock Omarchy splash script (proven
+code) with the logo swapped for a glowing orb cropped from your wallpaper,
+a frosted-glass pill password field, and a soft white progress bar. All PNGs —
+Plymouth **cannot load JPGs**, which is what broke an earlier attempt.
 
 ```bash
 # Install theme files
-pkexec bash -c 'mkdir -p /usr/share/plymouth/themes/macos && cp plymouth-macos-theme/* /usr/share/plymouth/themes/macos/ && chmod 644 /usr/share/plymouth/themes/macos/*'
+pkexec bash -c 'mkdir -p /usr/share/plymouth/themes/beautiful && cp plymouth-beautiful-theme/* /usr/share/plymouth/themes/beautiful/ && chmod 644 /usr/share/plymouth/themes/beautiful/*'
 
-# Activate and rebuild the boot image (Omarchy uses UKIs via limine-mkinitcpio)
-plymouth-set-default-theme macos
+# Activate and rebuild the boot image (Omarchy uses UKIs via limine-mkinitcpio;
+# plymouth-set-default-theme --rebuild-initrd does NOT work here — no mkinitcpio presets)
+plymouth-set-default-theme beautiful
 pkexec limine-mkinitcpio
 ```
 
 Revert:
 
 ```bash
-plymouth-set-default-theme omarchy
-pkexec limine-mkinitcpio
+pkexec bash -c 'plymouth-set-default-theme omarchy && limine-mkinitcpio'
 ```
 
-To see the SDDM login on **every** boot instead of autologin:
+To regenerate the orb from a new wallpaper:
 
 ```bash
-# disable autologin (you will type password on every boot)
-pkexec bash -c 'cat > /etc/sddm.conf.d/autologin.conf <<EOF
-# disabled - show SDDM on boot
-# [Autologin]
-# User=som2
-# Session=omarchy.desktop
-EOF'
+magick "$(readlink -f ~/.local/state/omarchy/current/background)" -resize 560x560^ -gravity center -extent 560x560 /tmp/orb-base.png
+magick /tmp/orb-base.png \( -size 560x560 xc:none -fill white -draw 'circle 280,280 280,20' \) -alpha off -compose CopyOpacity -composite /tmp/orb.png
+pkexec bash -c 'cp /tmp/orb.png /usr/share/plymouth/themes/beautiful/orb.png && limine-mkinitcpio'
 ```
 
-Re-enable autologin:
+To disable autologin and see the SDDM login on every boot (you will then type
+two passwords: disk + user):
 
 ```bash
-pkexec bash -c 'cat > /etc/sddm.conf.d/autologin.conf <<EOF
-[Autologin]
-User=som2
-Session=omarchy.desktop
-EOF'
+pkexec bash -c 'printf "# autologin disabled\n" > /etc/sddm.conf.d/autologin.conf'
 ```
-
----
 
 ## Files in this repo
 
 ```
-plymouth-macos-theme/    Plymouth boot splash (no logo, blurred background)
-  macos.plymouth         theme metadata
-  macos.script           splash script (blurred bg, no logo, keeps progress/password)
-  background.jpg         blurred wallpaper for boot
+plymouth-beautiful-theme/  Plymouth boot splash (Quattro orb, frosted pill field)
+  beautiful.plymouth     theme metadata
+  beautiful.script       stock splash script, logo swapped for orb
+  orb.png                glowing orb cropped from wallpaper (regenerate per-wallpaper)
+  entry/bullet/lock/progress_*.png  frosted-glass UI assets
 sddm-macos-theme/        SDDM theme (QML + assets; background.jpg generated by script)
   Main.qml               macOS-style greeter: blurred bg, avatar, pill password field
   metadata.desktop       SDDM theme metadata
