@@ -45,17 +45,21 @@ cat /etc/systemd/sleep.conf.d/10-maclike.conf
 echo
 
 echo "== Mac-like lid handling: /etc/systemd/logind.conf.d/30-maclike-lid.conf =="
+# No HandlePowerKey here (stays in 10-ignore-power-button.conf)
+# No IdleAction by default (Omarchy idle is shell-based: screensaver 150s / lock 300s)
 pkexec bash -c '
 mkdir -p /etc/systemd/logind.conf.d
 cat > /etc/systemd/logind.conf.d/30-maclike-lid.conf << "EOF"
-# Mac-like lid handling
+# Mac-like lid handling: does NOT clash with Omarchy Hyprland binding.
+# Hyprland Lid Switch -> omarchy-system-lid-close only locks; logind does suspend.
+# Omarchy ships no HandleLidSwitch override, so this extends default suspend.
+# Idle stays in omarchy.idle service, not logind.
 [Login]
 HandleLidSwitch=suspend-then-hibernate
 HandleLidSwitchExternalPower=suspend-then-hibernate
 HandleLidSwitchDocked=ignore
-HandlePowerKey=ignore
-IdleAction=suspend-then-hibernate
-IdleActionSec=30min
+#IdleAction=ignore
+#IdleActionSec=30min
 EOF
 cat /etc/systemd/logind.conf.d/30-maclike-lid.conf
 '
@@ -70,5 +74,5 @@ echo "Done. Reboot to apply logind changes."
 echo "Verify after reboot + hibernate:"
 echo "  journalctl -b 0 -k | grep -E 'PM: hibernation|nvidia.*PM:'"
 echo "  journalctl -b -1 | grep -E 'PM: hibernation: hibernation entry'"
-echo "To disable idle hibernate: pkexec bash -c 'sed -i s/^IdleAction=.*/IdleAction=ignore/ /etc/systemd/logind.conf.d/30-maclike-lid.conf'"
+echo "To enable idle auto-suspend (optional, not default): uncomment IdleAction in 30-maclike-lid.conf"
 echo "To fully revert: pkexec rm /etc/systemd/sleep.conf.d/10-maclike.conf /etc/systemd/logind.conf.d/30-maclike-lid.conf"

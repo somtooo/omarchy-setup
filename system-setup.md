@@ -474,20 +474,28 @@ Create `/etc/systemd/logind.conf.d/30-maclike-lid.conf`:
 
 ```ini
 # /etc/systemd/logind.conf.d/30-maclike-lid.conf
+# Does NOT clash with Omarchy's Hyprland lid binding.
+# Omarchy's binding (bindings/utilities.lua:1 switch:on:Lid Switch -> omarchy-system-lid-close)
+# only locks + reconciles displays; the actual suspend is via logind.
+# Omarchy ships /etc/systemd/logind.conf.d/10-ignore-power-button.conf (HandlePowerKey=ignore)
+# and /etc/systemd/logind.conf.d/20-inhibit-delay.conf (InhibitDelayMaxSec=15) but NO
+# HandleLidSwitch override (defaults to suspend), so this file extends it to
+# suspend-then-hibernate. PowerKey is NOT duplicated here.
+# Idle is handled by Omarchy's shell omarchy.idle (shell.json: screensaver 150s, lock 300s
+# in services/idle/Service.qml), NOT logind — keep IdleAction commented to avoid double suspend.
 [Login]
 HandleLidSwitch=suspend-then-hibernate
 HandleLidSwitchExternalPower=suspend-then-hibernate
 HandleLidSwitchDocked=ignore
-HandlePowerKey=ignore
-IdleAction=suspend-then-hibernate
-IdleActionSec=30min
+#IdleAction=ignore
+#IdleActionSec=30min
 ```
 
 - `HandleLidSwitch*` = `suspend-then-hibernate` gives mac-like lid close: wake instantly if you open <2 h, still zero battery drain after 2 h because systemd resumes briefly via `rtc_cmos.use_acpi_alarm=1` (`/etc/limine-entry-tool.d/rtc-alarm.conf` added by `omarchy-hibernation-setup` for `s2idle` machines) then hibernates to disk.
-- `Docked=ignore` keeps clamshell mode (lid closed with external monitor stays awake, handled by `omarchy-system-lid-close` + `omarchy-hyprland-monitor-clamshell`).
-- `HandlePowerKey=ignore` preserves Omarchy's `/etc/systemd/logind.conf.d/10-ignore-power-button.conf` — power is via `Super+Esc` menu (`omarchy-system-shutdown` etc.).
-- `IdleAction=30min` mimics macOS idle standby; set to `ignore` if you only want lid-triggered hibernate.
-- `InhibitDelayMaxSec=15` from `/etc/systemd/logind.conf.d/20-inhibit-delay.conf` is kept — gives `omarchy-system-sleep-monitor` + `omarchy-system-sleep-lock` time to lock before suspend.
+- `Docked=ignore` keeps clamshell mode (lid closed with external monitor stays awake, handled by `omarchy-system-lid-close:1` + `omarchy-hyprland-monitor-clamshell:1`). No clash: Hyprland binding `switch:on:Lid Switch` (`bindings/utilities.lua:1`) fires `omarchy-system-lid-close` which locks early (gives `omarchy-system-sleep-lock` a head start before `InhibitDelayMaxSec=15` expires), then logind does the suspend.
+- `HandlePowerKey` is intentionally NOT set here — it stays in Omarchy's `10-ignore-power-button.conf:1` (`HandlePowerKey=ignore`) so `Super+Esc` menu stays authoritative.
+- `IdleAction` is intentionally **commented** — Omarchy's idle is `omarchy.idle` (screensaver 150s / lock 300s), not systemd. Uncommenting `IdleAction=suspend-then-hibernate 30min` would be a second idle suspend path and is only opt-in (see 19.3 #5).
+- `InhibitDelayMaxSec=15` from `20-inhibit-delay.conf:1` is kept — gives `omarchy-system-sleep-monitor:1` + `omarchy-system-sleep-lock:1` time to lock before suspend.
 
 Apply without reboot:
 
@@ -524,10 +532,13 @@ journalctl -b 0 -k | grep -E "PM: hibernation|nvidia.*PM:"
 # previous hibernation entry:
 journalctl -b -1 | grep -E "PM: hibernation: hibernation entry|Performing sleep operation"
 
-# 4) lid test (requires reboot after config): close lid <2h -> wake is instant suspend; >2h or IdleAction 30min -> wakes via RTC alarm then hibernates (check journal after)
+# 4) lid test (requires reboot after config): close lid <2h -> wake is instant suspend; >2h -> wakes via RTC alarm then hibernates (check journal after)
+#    Idle suspend is intentionally NOT enabled (Omarchy idle = screensaver 150s + lock 300s).
+#    To add it (optional, not default): uncomment IdleAction below.
 
-# 5) revert idle hibernate if unwanted
-pkexec bash -c 'sed -i "s/^IdleAction=.*/IdleAction=ignore/" /etc/systemd/logind.conf.d/30-maclike-lid.conf'
+# 5) optional: enable idle auto-suspend (off by default to avoid clash with omarchy.idle)
+# pkexec bash -c 'printf "[Login]\nIdleAction=suspend-then-hibernate\nIdleActionSec=30min\n" > /etc/systemd/logind.conf.d/30-maclike-lid.conf' # WRONG — use sed to append:
+# pkexec bash -c 'echo -e "IdleAction=suspend-then-hibernate\nIdleActionSec=30min" >> /etc/systemd/logind.conf.d/30-maclike-lid.conf'
 
 # 6) revert all mac-like sleep (keep nvidia fix)
 pkexec rm /etc/systemd/sleep.conf.d/10-maclike.conf /etc/systemd/logind.conf.d/30-maclike-lid.conf
