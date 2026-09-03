@@ -388,9 +388,10 @@ omarchy toggle enabled suspend
 If it is disabled, toggle it with `omarchy toggle suspend`. Do not add a
 separate legacy suspend or hypridle service.
 
-### 19. Fix Hibernation Resume and Enable Mac-like Safe Sleep
+### 19. Fix NVIDIA Hibernation Resume
 
-> **Hardware:** ASUS ROG Zephyrus G16 GU605CR (Intel Core Ultra 9 285H + NVIDIA RTX 5070 Ti, 32 GiB RAM, hybrid Intel iGPU + NVIDIA dGPU, `s2idle` + `deep` sleep, Limine UKI, encrypted Btrfs `/` on `/dev/mapper/root` with `/swap/swapfile`).
+> **Hardware:** ASUS ROG Zephyrus G16 GU605CR (Intel Core Ultra 9 285H + NVIDIA RTX 5070 Ti, 32 GiB RAM, hybrid Intel iGPU + NVIDIA dGPU, Limine UKI, encrypted Btrfs `/` on `/dev/mapper/root` with `/swap/swapfile`).
+> **Note:** An earlier draft of this section added `suspend-then-hibernate`/`2h` `HibernateDelaySec` + logind lid drop-ins. **Removed 2026-09-03** (`scripts/setup-maclike-hibernation.sh` deleted) — that behavior is not part of Omarchy 4 defaults and may conflict with future Omarchy updates/idle handling. **Only the NVIDIA fix is kept.**
 
 #### 19.1 What broke (2026-09-01 — 2026-09-03)
 
@@ -433,9 +434,9 @@ Without `nvidia-sleep.sh hibernate` writing `hibernate` to that procfs file, `nv
 
 `resume=/dev/mapper/root resume_offset=3735407` in `/proc/cmdline` and `/etc/limine-entry-tool.d/resume.conf` matched `/sys/power/resume:253:0` + `/sys/power/resume_offset:3735407` and the `30.8G` `/swap/swapfile` (`swapon --show`, `/etc/fstab`) is correctly sized for `30 GiB` RAM. `/usr/lib/systemd/system-sleep/nvidia` alone only handles `post` `resume`; the `pre` path depends on the systemd units above. `zram0` at `priority 100` vs swapfile at `0` (`/usr/share/omarchy/default/systemd/zram-generator.conf.d`) is intentional and not the bug. `HOOKS+=(resume)` in `/etc/mkinitcpio.conf.d/omarchy_resume.conf` (appended after `btrfs-overlayfs` via `mkinitcpio.conf.d`) still runs at `early hook` time and did find the image; reordering is not required.
 
-#### 19.2 Fix applied (2026-09-03)
+#### 19.2 Fix applied (2026-09-03) — minimal, Omarchy defaults untouched
 
-**1) Enable NVIDIA suspend/hibernate helpers (critical)**
+**Enable NVIDIA suspend/hibernate helpers (critical)**
 
 ```bash
 pkexec bash -c 'systemctl enable nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service'
@@ -449,60 +450,14 @@ systemctl is-enabled nvidia-hibernate nvidia-resume nvidia-suspend nvidia-suspen
 
 What this does: `nvidia-sleep.sh` is now called via `Before=systemd-hibernate.service` etc., writing the correct string to `/proc/driver/nvidia/suspend` before `/usr/lib/systemd/system-sleep/nvidia` handles the `pre:hibernate`/`suspend-then-hibernate` edge cases. See `man nvidia-sleep.sh` and https://download.nvidia.com/XFree86/Linux-x86_64/595.45.04/README/powermanagement.html (`Configuring Power Management Support`).
 
-**2) Mac-like safe sleep (suspend-then-hibernate)**
+**That's it.** No systemd sleep/logind drop-ins were added. Omarchy 4 defaults are untouched:
 
-Create `/etc/systemd/sleep.conf.d/10-maclike.conf`:
+- `/etc/systemd/logind.conf.d/10-ignore-power-button.conf` (Omarchy: `HandlePowerKey=ignore` — `Super+Esc` menu)
+- `/etc/systemd/logind.conf.d/20-inhibit-delay.conf` (Omarchy: `InhibitDelayMaxSec=15` — lets `omarchy-system-sleep-lock` lock before suspend)
+- No `/etc/systemd/sleep.conf.d/*.conf` — systemd defaults + `omarchy-hibernation-setup` cmdline (`resume=/dev/mapper/root resume_offset=3735407`, `rtc_cmos.use_acpi_alarm=1`) is enough.
+- Hyprland `switch:on:Lid Switch` -> `omarchy-system-lid-close` still locks + handles clamshell; logind `HandleLidSwitch` still defaults to `suspend`.
 
-```ini
-# /etc/systemd/sleep.conf.d/10-maclike.conf
-[Sleep]
-AllowSuspend=yes
-AllowHibernation=yes
-AllowSuspendThenHibernate=yes
-AllowHybridSleep=no
-SuspendState=mem
-HibernateMode=platform shutdown
-MemorySleepMode=s2idle
-HibernateDelaySec=2h
-HibernateOnACPower=yes
-SuspendEstimationSec=60min
-```
-
-`s2idle` is modern standby on this `GU605CR` (`cat /sys/power/mem_sleep` shows `[s2idle] deep`) — instant wake like macOS, `2h` matches macOS `standbydelayhigh/low` (~3h). `/var/tmp` (on `/dev/mapper/root`, not tmpfs) satisfies `NVreg_TemporaryFilePath=/var/tmp`.
-
-Create `/etc/systemd/logind.conf.d/30-maclike-lid.conf`:
-
-```ini
-# /etc/systemd/logind.conf.d/30-maclike-lid.conf
-# Does NOT clash with Omarchy's Hyprland lid binding.
-# Omarchy's binding (bindings/utilities.lua:1 switch:on:Lid Switch -> omarchy-system-lid-close)
-# only locks + reconciles displays; the actual suspend is via logind.
-# Omarchy ships /etc/systemd/logind.conf.d/10-ignore-power-button.conf (HandlePowerKey=ignore)
-# and /etc/systemd/logind.conf.d/20-inhibit-delay.conf (InhibitDelayMaxSec=15) but NO
-# HandleLidSwitch override (defaults to suspend), so this file extends it to
-# suspend-then-hibernate. PowerKey is NOT duplicated here.
-# Idle is handled by Omarchy's shell omarchy.idle (shell.json: screensaver 150s, lock 300s
-# in services/idle/Service.qml), NOT logind — keep IdleAction commented to avoid double suspend.
-[Login]
-HandleLidSwitch=suspend-then-hibernate
-HandleLidSwitchExternalPower=suspend-then-hibernate
-HandleLidSwitchDocked=ignore
-#IdleAction=ignore
-#IdleActionSec=30min
-```
-
-- `HandleLidSwitch*` = `suspend-then-hibernate` gives mac-like lid close: wake instantly if you open <2 h, still zero battery drain after 2 h because systemd resumes briefly via `rtc_cmos.use_acpi_alarm=1` (`/etc/limine-entry-tool.d/rtc-alarm.conf` added by `omarchy-hibernation-setup` for `s2idle` machines) then hibernates to disk.
-- `Docked=ignore` keeps clamshell mode (lid closed with external monitor stays awake, handled by `omarchy-system-lid-close:1` + `omarchy-hyprland-monitor-clamshell:1`). No clash: Hyprland binding `switch:on:Lid Switch` (`bindings/utilities.lua:1`) fires `omarchy-system-lid-close` which locks early (gives `omarchy-system-sleep-lock` a head start before `InhibitDelayMaxSec=15` expires), then logind does the suspend.
-- `HandlePowerKey` is intentionally NOT set here — it stays in Omarchy's `10-ignore-power-button.conf:1` (`HandlePowerKey=ignore`) so `Super+Esc` menu stays authoritative.
-- `IdleAction` is intentionally **commented** — Omarchy's idle is `omarchy.idle` (screensaver 150s / lock 300s), not systemd. Uncommenting `IdleAction=suspend-then-hibernate 30min` would be a second idle suspend path and is only opt-in (see 19.3 #5).
-- `InhibitDelayMaxSec=15` from `20-inhibit-delay.conf:1` is kept — gives `omarchy-system-sleep-monitor:1` + `omarchy-system-sleep-lock:1` time to lock before suspend.
-
-Apply without reboot:
-
-```bash
-pkexec bash -c 'cat /etc/systemd/sleep.conf.d/10-maclike.conf; cat /etc/systemd/logind.conf.d/30-maclike-lid.conf; systemd-analyze cat-config systemd/sleep.conf | tail -n +1; systemd-analyze cat-config systemd/logind.conf | tail -n +1'
-# logind reloads on next reboot; to apply now: pkexec systemctl restart systemd-logind  (will log you out — reboot instead)
-```
+An earlier draft added `suspend-then-hibernate` (`HibernateDelaySec=2h`) and logind lid drop-ins; **removed 2026-09-03** — that behavior is not part of Omarchy 4 and may conflict with future Omarchy updates/idle handling. If you want it, configure manually or wait for an Omarchy setting.
 
 `omarchy-hibernation-setup` (`/usr/share/omarchy/bin/omarchy-hibernation-setup`) originally created `/swap/swapfile` (`btrfs filesystem mkswapfile -s MemTotal`), the `/swap` subvolume, the `resume=` + `rtc_cmos` drop-ins, and `/etc/mkinitcpio.conf.d/omarchy_resume.conf` (`HOOKS+=(resume)`). That setup is kept verified:
 
@@ -514,17 +469,13 @@ cat /sys/power/resume; cat /sys/power/resume_offset
 
 No `/usr/share/omarchy/default/systemd/system-sleep/force-igpu` is installed to `/usr/lib/systemd/system-sleep/` (it needs `supergfxctl`, not present; `asusd` handles the G16). The shipped `/usr/lib/systemd/system-sleep/nvidia`, `keyboard-backlight` (prevents ASUS KB LED hang on S4), and `unmount-fuse` (lazy-unmounts `gvfsd-fuse` before freeze) are kept.
 
-#### 19.3 Verify like a Mac
+#### 19.3 Verify hibernation
 
 ```bash
 # 1) nvidia helpers active
 systemctl is-enabled nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service
 
-# 2) sleep/logind effective config
-systemd-analyze cat-config systemd/sleep.conf
-systemd-analyze cat-config systemd/logind.conf
-
-# 3) dry-run hibernate (saves RAM to /swap/swapfile then powers off — save work first)
+# 2) dry-run hibernate (saves RAM to /swap/swapfile then powers off — save work first)
 systemctl hibernate
 # after power-on, should resume to desktop instantly; check:
 journalctl -b 0 -k | grep -E "PM: hibernation|nvidia.*PM:"
@@ -532,21 +483,11 @@ journalctl -b 0 -k | grep -E "PM: hibernation|nvidia.*PM:"
 # previous hibernation entry:
 journalctl -b -1 | grep -E "PM: hibernation: hibernation entry|Performing sleep operation"
 
-# 4) lid test (requires reboot after config): close lid <2h -> wake is instant suspend; >2h -> wakes via RTC alarm then hibernates (check journal after)
-#    Idle suspend is intentionally NOT enabled (Omarchy idle = screensaver 150s + lock 300s).
-#    To add it (optional, not default): uncomment IdleAction below.
-
-# 5) optional: enable idle auto-suspend (off by default to avoid clash with omarchy.idle)
-# pkexec bash -c 'printf "[Login]\nIdleAction=suspend-then-hibernate\nIdleActionSec=30min\n" > /etc/systemd/logind.conf.d/30-maclike-lid.conf' # WRONG — use sed to append:
-# pkexec bash -c 'echo -e "IdleAction=suspend-then-hibernate\nIdleActionSec=30min" >> /etc/systemd/logind.conf.d/30-maclike-lid.conf'
-
-# 6) revert all mac-like sleep (keep nvidia fix)
-pkexec rm /etc/systemd/sleep.conf.d/10-maclike.conf /etc/systemd/logind.conf.d/30-maclike-lid.conf
+# 3) revert the fix if needed
+pkexec systemctl disable nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service
 ```
 
 Rebuild UKI only if resume params or `mkinitcpio` hooks change: `pkexec limine-mkinitcpio`.
-
-See `scripts/setup-maclike-hibernation.sh` for a re-runnable setup.
 
 ### 20. Setup Btrfs Snapshots
 
