@@ -436,7 +436,7 @@ Without `nvidia-sleep.sh hibernate` writing `hibernate` to that procfs file, `nv
 
 #### 19.2 Fix applied (2026-09-03) — minimal, Omarchy defaults untouched
 
-**Enable NVIDIA suspend/hibernate helpers (critical)**
+**Step 1: Enable NVIDIA suspend/hibernate helpers (necessary but NOT sufficient)**
 
 ```bash
 pkexec bash -c 'systemctl enable nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service'
@@ -448,7 +448,29 @@ pkexec bash -c 'systemctl enable nvidia-hibernate.service nvidia-resume.service 
 systemctl is-enabled nvidia-hibernate nvidia-resume nvidia-suspend nvidia-suspend-then-hibernate  # -> enabled
 ```
 
-What this does: `nvidia-sleep.sh` is now called via `Before=systemd-hibernate.service` etc., writing the correct string to `/proc/driver/nvidia/suspend` before `/usr/lib/systemd/system-sleep/nvidia` handles the `pre:hibernate`/`suspend-then-hibernate` edge cases. See `man nvidia-sleep.sh` and https://download.nvidia.com/XFree86/Linux-x86_64/595.45.04/README/powermanagement.html (`Configuring Power Management Support`).
+What this does: `nvidia-sleep.sh` is now called via `Before=systemd-hibernate.service` etc. See `man nvidia-sleep.sh` and https://download.nvidia.com/XFree86/Linux-x86_64/595.45.04/README/powermanagement.html (`Configuring Power Management Support`).
+
+**Step 2: Disable `NVreg_UseKernelSuspendNotifiers` (critical — without this, step 1 is a no-op)**
+
+The open kernel module (`nvidia-open-dkms` 610.57.04) has a bug: with `NVreg_UseKernelSuspendNotifiers=1`, `/proc/driver/nvidia/suspend` is **not created** (`nv-procfs.c`: `if (NVreg_UseKernelSuspendNotifiers) create_suspend_file = NV_FALSE`). But `nv_pmops_freeze` still calls `nvidia_suspend(dev, NV_PM_ACTION_HIBERNATE, NV_FALSE)` which **requires** the procfs path to have been used first (`is_procfs_suspend=TRUE`) to bypass the `PreserveVideoMemoryAllocations` check. The PM notifier path doesn't set the per-device flag, so freeze still fails with `-5`.
+
+Fix by disabling kernel suspend notifiers so the procfs file is created:
+
+```bash
+pkexec bash -c '
+  sed -i "s/NVreg_UseKernelSuspendNotifiers=1/NVreg_UseKernelSuspendNotifiers=0/" /usr/lib/modprobe.d/nvidia-sleep.conf
+  cat /usr/lib/modprobe.d/nvidia-sleep.conf
+  limine-mkinitcpio
+'
+```
+
+> **Note:** `/usr/lib/modprobe.d/nvidia-sleep.conf` is a package file (`nvidia-utils`); the change may be overwritten on package update. If hibernate breaks again after update, add `/etc/modprobe.d/nvidia-sleep.conf` with `options nvidia NVreg_UseKernelSuspendNotifiers=0` to override.
+
+**After reboot, verify:**
+```bash
+ls /proc/driver/nvidia/suspend          # should exist now
+cat /proc/driver/nvidia/params | grep -i notifier  # should show UseKernelSuspendNotifiers: 0
+```
 
 **That's it.** No systemd sleep/logind drop-ins were added. Omarchy 4 defaults are untouched:
 
@@ -475,7 +497,11 @@ No `/usr/share/omarchy/default/systemd/system-sleep/force-igpu` is installed to 
 # 1) nvidia helpers active
 systemctl is-enabled nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service
 
-# 2) dry-run hibernate (saves RAM to /swap/swapfile then powers off — save work first)
+# 2) procfs suspend interface exists (requires reboot after step 2)
+ls /proc/driver/nvidia/suspend
+cat /proc/driver/nvidia/params | grep -i notifier
+
+# 3) dry-run hibernate (saves RAM to /swap/swapfile then powers off — save work first)
 systemctl hibernate
 # after power-on, should resume to desktop instantly; check:
 journalctl -b 0 -k | grep -E "PM: hibernation|nvidia.*PM:"
@@ -483,8 +509,9 @@ journalctl -b 0 -k | grep -E "PM: hibernation|nvidia.*PM:"
 # previous hibernation entry:
 journalctl -b -1 | grep -E "PM: hibernation: hibernation entry|Performing sleep operation"
 
-# 3) revert the fix if needed
+# 4) revert the fix if needed
 pkexec systemctl disable nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service
+pkexec bash -c 'sed -i "s/NVreg_UseKernelSuspendNotifiers=0/NVreg_UseKernelSuspendNotifiers=1/" /usr/lib/modprobe.d/nvidia-sleep.conf; limine-mkinitcpio'
 ```
 
 Rebuild UKI only if resume params or `mkinitcpio` hooks change: `pkexec limine-mkinitcpio`.
