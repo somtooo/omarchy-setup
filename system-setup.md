@@ -391,7 +391,7 @@ separate legacy suspend or hypridle service.
 ### 19. Fix NVIDIA Hibernation Resume
 
 > **Hardware:** ASUS ROG Zephyrus G16 GU605CR (Intel Core Ultra 9 285H + NVIDIA RTX 5070 Ti, 32 GiB RAM, hybrid Intel iGPU + NVIDIA dGPU, Limine UKI, encrypted Btrfs `/` on `/dev/mapper/root` with `/swap/swapfile`).
-> **Note:** An earlier draft of this section added `suspend-then-hibernate`/`2h` `HibernateDelaySec` + logind lid drop-ins. **Removed 2026-09-03** (`scripts/setup-maclike-hibernation.sh` deleted) — that behavior is not part of Omarchy 4 defaults and may conflict with future Omarchy updates/idle handling. **Only the NVIDIA fix is kept.**
+> **Note:** An earlier draft of this section added `suspend-then-hibernate`/`2h` `HibernateDelaySec` + logind lid drop-ins. **Removed 2026-09-03** — that behavior is not part of Omarchy 4 defaults. **Only the NVIDIA fix is kept.**
 
 #### 19.1 What broke (2026-09-01 — 2026-09-03)
 
@@ -419,24 +419,13 @@ kernel: PM: hibernation: Failed to load image, recovering.
 kernel: PM: hibernation: resume failed (-5)
 ```
 
-**Root cause:** `/usr/lib/modprobe.d/gsr-nvidia.conf:1` `NVreg_PreserveVideoMemoryAllocations=1` with `/usr/lib/modprobe.d/nvidia-sleep.conf:1-2` `NVreg_TemporaryFilePath=/var/tmp` + `NVreg_UseKernelSuspendNotifiers=1` requires the NVIDIA procfs suspend interface (`/proc/driver/nvidia/suspend`) to be driven **before** freeze by `nvidia-sleep.sh`. The four NVIDIA sleep units were `disabled`:
+**Root cause:** The open kernel module (`nvidia-open-dkms` 610.57.04) has a bug in `nv_pmops_freeze()`: it calls `nvidia_suspend(dev, NV_PM_ACTION_HIBERNATE, NV_FALSE)` with `is_procfs_suspend=NV_FALSE` hardcoded. When `NVreg_PreserveVideoMemoryAllocations=1` (`/usr/lib/modprobe.d/gsr-nvidia.conf:1`), this always hits the preserve check and returns `-5`, discarding the hibernation image.
 
-```
-/usr/lib/systemd/system/nvidia-hibernate.service
-/usr/lib/systemd/system/nvidia-resume.service
-/usr/lib/systemd/system/nvidia-suspend.service
-/usr/lib/systemd/system/nvidia-suspend-then-hibernate.service
-
-systemctl is-enabled nvidia-hibernate nvidia-resume nvidia-suspend  # -> disabled
-```
-
-Without `nvidia-sleep.sh hibernate` writing `hibernate` to that procfs file, `nvidia:pm: pci_pm_freeze` fails with `-5` and the whole hibernation image is discarded -> looks like a shutdown.
-
-`resume=/dev/mapper/root resume_offset=3735407` in `/proc/cmdline` and `/etc/limine-entry-tool.d/resume.conf` matched `/sys/power/resume:253:0` + `/sys/power/resume_offset:3735407` and the `30.8G` `/swap/swapfile` (`swapon --show`, `/etc/fstab`) is correctly sized for `30 GiB` RAM. `/usr/lib/systemd/system-sleep/nvidia` alone only handles `post` `resume`; the `pre` path depends on the systemd units above. `zram0` at `priority 100` vs swapfile at `0` (`/usr/share/omarchy/default/systemd/zram-generator.conf.d`) is intentional and not the bug. `HOOKS+=(resume)` in `/etc/mkinitcpio.conf.d/omarchy_resume.conf` (appended after `btrfs-overlayfs` via `mkinitcpio.conf.d`) still runs at `early hook` time and did find the image; reordering is not required.
+`NVreg_UseKernelSuspendNotifiers=1` (`/usr/lib/modprobe.d/nvidia-sleep.conf:1`) was also tried, but it prevents `/proc/driver/nvidia/suspend` from being created (`nv-procfs.c`: `if (NVreg_UseKernelSuspendNotifiers) create_suspend_file = NV_FALSE`), so `nvidia-sleep.sh` exits 0 (no-op) even when the systemd services are enabled.
 
 #### 19.2 Fix applied (2026-09-03) — minimal, Omarchy defaults untouched
 
-**Step 1: Enable NVIDIA suspend/hibernate helpers (necessary but NOT sufficient)**
+**Step 1: Enable NVIDIA suspend/hibernate helpers**
 
 ```bash
 pkexec bash -c 'systemctl enable nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service'
@@ -448,28 +437,31 @@ pkexec bash -c 'systemctl enable nvidia-hibernate.service nvidia-resume.service 
 systemctl is-enabled nvidia-hibernate nvidia-resume nvidia-suspend nvidia-suspend-then-hibernate  # -> enabled
 ```
 
-What this does: `nvidia-sleep.sh` is now called via `Before=systemd-hibernate.service` etc. See `man nvidia-sleep.sh` and https://download.nvidia.com/XFree86/Linux-x86_64/595.45.04/README/powermanagement.html (`Configuring Power Management Support`).
+**Step 2: Disable `NVreg_PreserveVideoMemoryAllocations` (critical)**
 
-**Step 2: Disable `NVreg_UseKernelSuspendNotifiers` (critical — without this, step 1 is a no-op)**
-
-The open kernel module (`nvidia-open-dkms` 610.57.04) has a bug: with `NVreg_UseKernelSuspendNotifiers=1`, `/proc/driver/nvidia/suspend` is **not created** (`nv-procfs.c`: `if (NVreg_UseKernelSuspendNotifiers) create_suspend_file = NV_FALSE`). But `nv_pmops_freeze` still calls `nvidia_suspend(dev, NV_PM_ACTION_HIBERNATE, NV_FALSE)` which **requires** the procfs path to have been used first (`is_procfs_suspend=TRUE`) to bypass the `PreserveVideoMemoryAllocations` check. The PM notifier path doesn't set the per-device flag, so freeze still fails with `-5`.
-
-Fix by disabling kernel suspend notifiers so the procfs file is created:
+The open kernel module cannot hibernate with video memory preservation enabled because `nv_pmops_freeze` hardcodes `is_procfs_suspend=NV_FALSE`. Disable it:
 
 ```bash
 pkexec bash -c '
-  sed -i "s/NVreg_UseKernelSuspendNotifiers=1/NVreg_UseKernelSuspendNotifiers=0/" /usr/lib/modprobe.d/nvidia-sleep.conf
-  cat /usr/lib/modprobe.d/nvidia-sleep.conf
+  sed -i "s/NVreg_PreserveVideoMemoryAllocations=1/NVreg_PreserveVideoMemoryAllocations=0/" /usr/lib/modprobe.d/gsr-nvidia.conf
+  cat /usr/lib/modprobe.d/gsr-nvidia.conf
   limine-mkinitcpio
 '
 ```
 
-> **Note:** `/usr/lib/modprobe.d/nvidia-sleep.conf` is a package file (`nvidia-utils`); the change may be overwritten on package update. If hibernate breaks again after update, add `/etc/modprobe.d/nvidia-sleep.conf` with `options nvidia NVreg_UseKernelSuspendNotifiers=0` to override.
+> **Tradeoff:** NVIDIA apps (games, CUDA) will lose state on hibernate. Display/compositor is on Intel iGPU, so desktop restores fine. Only `warp-terminal` uses NVIDIA (256MiB) and restarts on resume. Safe for hybrid laptop.
 
-**After reboot, verify:**
+> **Note:** `/usr/lib/modprobe.d/gsr-nvidia.conf` is a package file (`nvidia-utils`); the change may be overwritten on package update. If hibernate breaks again after update, add `/etc/modprobe.d/nvidia.conf` with `options nvidia NVreg_PreserveVideoMemoryAllocations=0` to override.
+
+**Step 3: Revert `UseKernelSuspendNotifiers` back to 1 (optional)**
+
+With `PreserveVideoMemoryAllocations=0`, the kernel suspend notifiers path works correctly and is preferred for modern suspend. Revert the earlier change:
+
 ```bash
-ls /proc/driver/nvidia/suspend          # should exist now
-cat /proc/driver/nvidia/params | grep -i notifier  # should show UseKernelSuspendNotifiers: 0
+pkexec bash -c '
+  sed -i "s/NVreg_UseKernelSuspendNotifiers=0/NVreg_UseKernelSuspendNotifiers=1/" /usr/lib/modprobe.d/nvidia-sleep.conf
+  limine-mkinitcpio
+'
 ```
 
 **That's it.** No systemd sleep/logind drop-ins were added. Omarchy 4 defaults are untouched:
@@ -478,8 +470,6 @@ cat /proc/driver/nvidia/params | grep -i notifier  # should show UseKernelSuspen
 - `/etc/systemd/logind.conf.d/20-inhibit-delay.conf` (Omarchy: `InhibitDelayMaxSec=15` — lets `omarchy-system-sleep-lock` lock before suspend)
 - No `/etc/systemd/sleep.conf.d/*.conf` — systemd defaults + `omarchy-hibernation-setup` cmdline (`resume=/dev/mapper/root resume_offset=3735407`, `rtc_cmos.use_acpi_alarm=1`) is enough.
 - Hyprland `switch:on:Lid Switch` -> `omarchy-system-lid-close` still locks + handles clamshell; logind `HandleLidSwitch` still defaults to `suspend`.
-
-An earlier draft added `suspend-then-hibernate` (`HibernateDelaySec=2h`) and logind lid drop-ins; **removed 2026-09-03** — that behavior is not part of Omarchy 4 and may conflict with future Omarchy updates/idle handling. If you want it, configure manually or wait for an Omarchy setting.
 
 `omarchy-hibernation-setup` (`/usr/share/omarchy/bin/omarchy-hibernation-setup`) originally created `/swap/swapfile` (`btrfs filesystem mkswapfile -s MemTotal`), the `/swap` subvolume, the `resume=` + `rtc_cmos` drop-ins, and `/etc/mkinitcpio.conf.d/omarchy_resume.conf` (`HOOKS+=(resume)`). That setup is kept verified:
 
@@ -497,9 +487,9 @@ No `/usr/share/omarchy/default/systemd/system-sleep/force-igpu` is installed to 
 # 1) nvidia helpers active
 systemctl is-enabled nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service
 
-# 2) procfs suspend interface exists (requires reboot after step 2)
-ls /proc/driver/nvidia/suspend
-cat /proc/driver/nvidia/params | grep -i notifier
+# 2) after reboot, verify params applied
+cat /proc/driver/nvidia/params | grep -i preserve  # should show 0
+cat /proc/driver/nvidia/params | grep -i notifier  # should show 1 (if reverted)
 
 # 3) dry-run hibernate (saves RAM to /swap/swapfile then powers off — save work first)
 systemctl hibernate
@@ -511,11 +501,10 @@ journalctl -b -1 | grep -E "PM: hibernation: hibernation entry|Performing sleep 
 
 # 4) revert the fix if needed
 pkexec systemctl disable nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service
-pkexec bash -c 'sed -i "s/NVreg_UseKernelSuspendNotifiers=0/NVreg_UseKernelSuspendNotifiers=1/" /usr/lib/modprobe.d/nvidia-sleep.conf; limine-mkinitcpio'
+pkexec bash -c 'sed -i "s/NVreg_PreserveVideoMemoryAllocations=0/NVreg_PreserveVideoMemoryAllocations=1/" /usr/lib/modprobe.d/gsr-nvidia.conf; limine-mkinitcpio'
 ```
 
 Rebuild UKI only if resume params or `mkinitcpio` hooks change: `pkexec limine-mkinitcpio`.
-
 ### 20. Setup Btrfs Snapshots
 
 Omarchy creates Snapper snapshots for system updates. These are separate from
