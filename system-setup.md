@@ -456,16 +456,18 @@ After fixing that, a second symptom: hibernate entry hangs with a black screen a
 
 #### 19.3 Fix
 
-**1. Disable kernel suspend notifiers so the procfs interface exists.** Use an `/etc/modprobe.d/` drop-in (survives package updates; do not edit the package files in `/usr/lib/modprobe.d/`):
+**1. Disable kernel suspend notifiers so the procfs interface exists.** This must be a **same-named shadow** of the packaged `/usr/lib/modprobe.d/nvidia-sleep.conf` — per modprobe.d(5), a file in `/etc/modprobe.d/` with the *same filename* completely replaces the packaged one. A *differently*-named drop-in (e.g. `nvidia-hibernate.conf`) does NOT work: both files load in lexicographic order and the packaged `=1` wins because it sorts later. (Regression seen 2026-09-04: suspend froze mid-entry after a package refresh re-asserted the packaged default.)
 
 ```bash
-pkexec bash -c 'cat > /etc/modprobe.d/nvidia-hibernate.conf << "EOF"
-# Create /proc/driver/nvidia/suspend so nvidia-sleep.sh can drive VRAM
-# preservation. Required for hibernate with NVreg_PreserveVideoMemoryAllocations=1
-# (set by gpu-screen-recorder'''s /usr/lib/modprobe.d/gsr-nvidia.conf).
+pkexec bash -c 'cat > /etc/modprobe.d/nvidia-sleep.conf << "EOF"
+# Shadow of /usr/lib/modprobe.d/nvidia-sleep.conf. The packaged file sets
+# NVreg_UseKernelSuspendNotifiers=1, which suppresses /proc/driver/nvidia/suspend
+# and breaks suspend/hibernate here (nv_pmops_freeze -> -5).
 options nvidia NVreg_UseKernelSuspendNotifiers=0
 EOF'
 ```
+
+Verify with `modprobe -c | grep UseKernelSuspendNotifiers` — every line must say `=0`. Requires a reboot to apply to the loaded module.
 
 **2. Enable the NVIDIA sleep services** so `nvidia-sleep.sh` writes `hibernate`/`resume` to the procfs interface around the sleep cycle:
 
@@ -516,7 +518,7 @@ journalctl -b 0 -k | grep -E "PM: hibernation|nvidia.*PM:"
 
 ```bash
 pkexec systemctl disable nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service
-pkexec rm /etc/modprobe.d/nvidia-hibernate.conf
+pkexec rm /etc/modprobe.d/nvidia-sleep.conf
 pkexec bash -c 'mv /etc/mkinitcpio.conf.d/nvidia.conf.disabled /etc/mkinitcpio.conf.d/nvidia.conf; limine-mkinitcpio'
 ```
 
