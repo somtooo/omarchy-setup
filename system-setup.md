@@ -568,21 +568,25 @@ the defaults are correct. (To shorten the 2h delay, an optional drop-in is
 phase uses the default sleep state (now s2idle again). The broken `deep` path
 only ever affected the suspend phase.
 
-**Testing note.** To verify suspend-then-hibernate, set a short delay:
+**Hibernate delay.** suspend-then-hibernate stays in s2idle for
+`HibernateDelaySec`, then hibernates to disk. Set to **35 min** — long enough
+that briefly stepping away wakes instantly, short enough that a real absence
+hits zero-drain hibernate:
 
 ```bash
 pkexec bash -c 'mkdir -p /etc/systemd/sleep.conf.d && cat > /etc/systemd/sleep.conf.d/hibernate-delay.conf << "EOF"
 [Sleep]
-HibernateDelaySec=3min
+HibernateDelaySec=35min
 EOF'
 ```
 
-Then run `systemctl suspend-then-hibernate` (NOT `systemctl suspend` — that verb
-is hardcoded to plain suspend and bypasses the logind preference). Expect:
-sleep in a few seconds, self-wake at 3 min, ~4 min writing the image with the
-screen on (this looks stuck but is not — do not hard-reset), then power off.
-Resume shows the SDDM login (normal for encrypted hibernate). Raise or remove
-the drop-in once confirmed.
+To **test** the full cycle quickly, temporarily set it to `3min` and run
+`systemctl suspend-then-hibernate` (NOT `systemctl suspend` — that verb is
+hardcoded to plain suspend and bypasses the logind preference). Expect: sleep
+in a few seconds, self-wake at 3 min, ~4 min writing the image with the screen
+on (this looks stuck but is not — do not hard-reset), then power off. Resume
+shows the SDDM login (normal for encrypted hibernate). Set it back to `35min`
+when done.
 
 #### 19.8 Hibernate writes the image but never powers off (fans/backlight stay on)
 
