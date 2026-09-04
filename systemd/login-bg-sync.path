@@ -1,0 +1,13 @@
+[Unit]
+Description=Regenerate blurred login/lock backgrounds when the Omarchy wallpaper changes
+
+[Path]
+# `omarchy theme bg set` re-points the current/background symlink; a theme
+# switch swaps current/theme and rewrites theme.name. Watch both so any
+# wallpaper change regenerates the blurred backgrounds.
+PathChanged=%h/.local/state/omarchy/current/background
+PathChanged=%h/.local/state/omarchy/current/theme.name
+Unit=login-bg-sync.service
+
+[Install]
+WantedBy=default.target

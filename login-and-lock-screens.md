@@ -148,7 +148,26 @@ edit the `OUT_DIR` variable at the top if you keep this repo elsewhere.)
 
 The lock screen now uses the pre-blurred `lock-blur.jpg` from the script, so
 **both** screens need `sync-login-bg.sh` after a wallpaper change (the lock no
-longer follows wallpaper changes automatically).
+longer follows wallpaper changes automatically). A systemd path unit does this
+for you — see below.
+
+### Auto-regenerate on wallpaper change
+
+`systemd/login-bg-sync.path` + `.service` watch
+`~/.local/state/omarchy/current/background` and `theme.name`; whenever the
+wallpaper/theme changes they re-run `sync-login-bg.sh` (with a 2s debounce).
+Install:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp omarchy-setup/systemd/login-bg-sync.* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now login-bg-sync.path
+```
+
+The lock screen background updates automatically from then on. The SDDM
+greeter background is also regenerated but still needs a one-time
+`pkexec cp` into `/usr/share/sddm/themes/macos/` to go live (root-owned dir).
 
 To change the avatar, replace `~/.local/share/login-look/avatar.png` (lock) and
 `/usr/share/sddm/themes/macos/avatar.png` (login). Generate a circular one from
