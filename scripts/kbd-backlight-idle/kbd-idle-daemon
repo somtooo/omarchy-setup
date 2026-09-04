@@ -45,18 +45,17 @@ fi
 
 echo "kbd-idle-daemon: watching keyboard=$KBD_DEV touchpad=${TPAD_DEV:-none}, idle timeout ${IDLE_SECS}s" >&2
 
-now() { echo "$EPOCHSECONDS"; }
-get_b() { cat "$LED_PATH/brightness" 2>/dev/null || echo 0; }
+get_b() { local v; v=$(cat "$LED_PATH/brightness" 2>/dev/null); echo "${v:-0}"; }
 set_b() { echo "$1" > "$LED_PATH/brightness" 2>/dev/null; }
-get_L() { cat "$STATE_FILE" 2>/dev/null || echo 1; }
-set_L() { echo "$1" > "$STATE_FILE"; }
-last_event() { cat "$LAST_EVENT_FILE" 2>/dev/null || echo 0; }
+get_L() { local v; v=$(cat "$STATE_FILE" 2>/dev/null); echo "${v:-1}"; }
+set_L() { echo "$1" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"; }
+last_event() { local v; v=$(cat "$LAST_EVENT_FILE" 2>/dev/null); echo "${v:-$EPOCHSECONDS}"; }
+stamp() { echo "$EPOCHSECONDS" > "$LAST_EVENT_FILE.tmp" && mv "$LAST_EVENT_FILE.tmp" "$LAST_EVENT_FILE"; }
 
 # Initialize: adopt current brightness as the level (default 1 if dark).
 b=$(get_b)
 if (( b > 0 )); then set_L "$b"; else [[ -e $STATE_FILE ]] || set_L 1; fi
-now > /dev/null  # warm EPOCHSECONDS
-echo "$EPOCHSECONDS" > "$LAST_EVENT_FILE"
+stamp
 
 # Input watchers: each 24-byte input_event read = activity. Just stamp the
 # clock; the control loop does the rest on its next tick.
@@ -64,7 +63,7 @@ watcher() {
   local dev=$1
   while true; do
     while dd if="$dev" bs=24 count=1 status=none iflag=fullblock of=/dev/null 2>/dev/null; do
-      echo "$EPOCHSECONDS" > "$LAST_EVENT_FILE"
+      stamp
     done
     sleep 1
   done
@@ -77,17 +76,21 @@ if [[ -n $TPAD_DEV && -e $TPAD_DEV ]]; then
   PIDS="$PIDS $!"
 fi
 
-cleanup() { kill $PIDS 2>/dev/null; rm -f "$LAST_EVENT_FILE"; }
+cleanup() { kill $PIDS 2>/dev/null; rm -f "$LAST_EVENT_FILE" "$LAST_EVENT_FILE.tmp" "$STATE_FILE.tmp"; }
 trap cleanup EXIT
 
 # Control loop.
-we_turned_it_off=0
+# Start with we_turned_it_off=1: darkness present at startup (boot, service
+# restart after a crash, resume with a fresh process) is system-caused, not
+# a manual user-off, so it must never zero L.
+we_turned_it_off=1
 prev_now=$EPOCHSECONDS
 while true; do
   sleep 2
   b=$(get_b)
   L=$(get_L)
-  a=$(( EPOCHSECONDS - $(last_event) ))
+  le=$(last_event)
+  a=$(( EPOCHSECONDS - le ))
 
   # Suspend/resume detection: wall clock jumped far beyond our sleep interval.
   # Treat any current darkness as system-caused (EC clears the backlight on
@@ -109,13 +112,12 @@ while true; do
   if (( L > 0 && a < IDLE_SECS )); then desired=$L; else desired=0; fi
   if (( b != desired )); then
     set_b "$desired"
-    # Remember "we turned it off" until activity resumes, so the dark state
-    # we created is not mistaken for a manual user-off on a later tick.
+    # Remember "we turned it off" until we relight, so darkness we created
+    # is not mistaken for a manual user-off on a later tick.
     if (( desired == 0 )); then we_turned_it_off=1; fi
   fi
-  if (( a < IDLE_SECS && b == 0 && we_turned_it_off == 1 )); then
-    # Activity resumed while dark from our own idle-off: this tick will
-    # relight (desired = L); the flag has served its purpose.
+  if (( we_turned_it_off == 1 && desired > 0 && b == 0 )); then
+    # We just relit (this tick or a prior one): flag has served its purpose.
     we_turned_it_off=0
   fi
 done

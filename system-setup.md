@@ -549,7 +549,11 @@ Suspend/resume falls out of the same math: across deep sleep the wall clock
 jumps and the ASUS EC clears the backlight. The daemon notices the jump
 (elapsed time between ticks ≫ poll interval), classifies the darkness as
 system-caused rather than a manual off, keeps `L`, and relights on the first
-keystroke or touchpad touch.
+keystroke or touchpad touch. The same classification applies at process
+start (boot, or a systemd restart after a crash): darkness at startup is
+never treated as user intent, so `L` survives anything. State file writes
+are atomic (tmp + rename) and every sysfs/state read has a default, so a
+suspend freezing the process mid-write cannot crash the loop or corrupt `L`.
 
 Input events are read as raw `input_event`s with `dd` (no evtest/libinput
 dependency). Because **keyd** grabs the physical keyboard, the daemon watches
