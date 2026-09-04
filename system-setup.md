@@ -87,7 +87,7 @@ o.bind("SHIFT + ALT + S", "Screenshot", "omarchy-capture-screenshot")
 ```
 
 Fn+F2/F3 (keyboard backlight) are different: the EC handles them entirely in
-hardware and sends nothing to Linux — see [19b](#19b-dell-style-keyboard-backlight-idle-off-asus).
+hardware and sends nothing to Linux — see [19b](#19b-keyboard-backlight-on-while-typing-off-when-idle-asus).
 
 ---
 
@@ -676,108 +676,29 @@ With this, if the lock cannot be acquired the unit gives up after ~10 s and
 suspend continues (unlocked), rather than the machine hanging. This is a
 workaround for an upstream defect; re-check after Omarchy updates.
 
-### 19b. Dell-style Keyboard Backlight Idle-Off (ASUS)
+### 19b. Keyboard Backlight: On While Typing, Off When Idle (ASUS)
 
-> **Hardware:** ASUS ROG Zephyrus G16 GU605CR, but works on any ASUS laptop
+> **Hardware:** ASUS ROG Zephyrus G16 GU605CR. Works on any ASUS laptop
 > exposing `/sys/class/leds/asus::kbd_backlight`.
-> **Tested 2026-09-04:** instant relight on keypress/touchpad, idle-off after
-> 30s, level survives suspend/resume and reboot, Super+F2/F3 adjust with the
-> Omarchy OSD.
 
-Unlike Dell laptops (whose EC turns the keyboard backlight on while typing
-and fades it out when idle), ASUS exposes only a raw brightness level
-(`asus::kbd_backlight`, levels 0-3) to Linux, and asusctl v6 removed its old
-`awake` LED mode. This section installs `kbd-backlightd`, a tiny Python
-daemon that recreates the Dell behavior.
+ASUS laptops leave the keyboard backlight on permanently at whatever level
+was last set. This installs `kbd-backlightd`, a small Python daemon (stdlib
+only) that gives the Dell-style behavior: the backlight lights when you type
+or touch the touchpad, and turns off after 30s of no input. It handles
+suspend/resume and reboot correctly.
 
-#### Design
+Behavior:
 
-One process, one thread, one selector event loop. All state lives in memory
-inside that loop, so races are impossible by construction — every event
-(input, command, timer) is processed atomically, one at a time. (Earlier
-shell-script versions of this feature kept state in files shared between a
-handful of concurrent processes; every bug they had was the same race in a
-new costume.)
+- Any keyboard or touchpad activity: backlight on, instantly, at your level.
+- 30s without input: backlight off.
+- Super+F2 / Super+F3 (physical Ctrl+F2/F3 with the keyd macOS map): adjust
+  the level, 0-3, with the Omarchy OSD. 0 = off until you raise it again.
+- The level survives sleep, hibernate, and reboot.
 
-The daemon maintains a single invariant:
-
-```
-LED = L   if L > 0 and (now - last_input) < IDLE_SECS
-LED = 0   otherwise
-```
-
-State (all in the daemon's memory; nothing else on the system reads or writes
-any of it):
-
-| State | Meaning | Written by |
-|---|---|---|
-| `L` | the user's chosen level (0-3); 0 = user turned it off | **only** the `up`/`down`/`off` commands |
-| `last_input` | timestamp of last keyboard/touchpad activity | only input events |
-| `last_wrote` | the last value this daemon wrote to the LED | the daemon itself |
-
-The daemon never reads the LED register on the hot path — it tracks what it
-last wrote and trusts only that. The EC (which handles the hardware Fn keys
-and clears the backlight across suspend entirely behind Linux's back) is
-treated as what it is: an uncooperative device whose interference is undone,
-not tracked.
-
-Event handling:
-
-| Event | Action |
-|---|---|
-| input event | `last_input = now`; if `L > 0 and last_wrote != L`, write `L` (exactly one write) |
-| `up` / `down` | `L = clamp(L ± 1, 0, 3)`; persist; write LED; show OSD |
-| `off` | `L = 0`; persist; write 0; show OSD |
-| timer | if `last_wrote > 0` and idle ≥ `IDLE_SECS`, write 0; `last_wrote = 0` |
-
-Key properties:
-
-- **Suspend/resume = cache invalidation + device re-scan, nothing more.** The
-  daemon freezes with the system; on the first loop iteration after a
-  wall-clock/monotonic-clock divergence (i.e. we slept) it sets
-  `last_wrote = None` — "we were not in control during sleep, so assume we
-  wrote nothing" — and re-opens the input devices, because keyd's virtual
-  keyboard can land on a *new* event node across hibernate/resume, leaving the
-  old fds dead (a dead fd is permanently readable in epoll, so failing to
-  unregister it livelocks the loop — observed 2026-09-04: keyboard stayed dark
-  after hibernate with the daemon running and spinning). No logind hooks, no
-  D-Bus listeners.
-- **Normal typing costs zero sysfs writes** (`last_wrote == L` → skip).
-  Relight after idle or sleep costs exactly one write. Commands always write
-  (a deliberate press should always apply, even if the level didn't change).
-- **Hardware changes are never adopted into `L`.** The EC's own Fn-key
-  handling (see below) and any other out-of-band writes only affect the LED
-  until the next event re-asserts the invariant. One writer for intent, ever.
-- **`L` is persisted** (atomic `os.replace`) only when it changes, to
-  `/var/lib/kbd-backlightd/level`. On startup the daemon reads it; if absent
-  it adopts the current hardware level.
-- **Performance:** the hot path is `select()` wake → read one 24-byte
-  `input_event` → compare two integers in memory. No subprocesses, no disk
-  reads, no LED reads, no polling. When dark the loop sleeps in `select()`
-  with no timeout at all.
-
-#### The Fn key problem
-
-On this machine the EC consumes the keyboard-backlight Fn keys (Fn+F2/F3)
-entirely in hardware: they change the LEDs but emit **zero** Linux input
-events (verified: nothing on the AT keyboard, WMI hotkeys, or keyd devices),
-so they can never drive an OSD or serve as an intent signal.
-
-The F-row *does* send real F-keycodes when a modifier is held, so brightness
-control is bound to **Super+F2/F3** (physical Ctrl+F2/F3 under the keyd macOS
-map). The binding calls `kbd-backlight up|down`, a tiny client that sends the
-command to the daemon over its control socket — keeping the daemon the single
-writer of `L` and adding the Omarchy OSD.
-
-Add to `~/.config/hypr/bindings.lua`:
-
-```lua
-o.bind("SUPER + F2", "Keyboard brightness down", "kbd-backlight down", { locked = true })
-o.bind("SUPER + F3", "Keyboard brightness up", "kbd-backlight up", { locked = true })
-```
-
-The EC's Fn+F2/F3 still change the hardware level, but the daemon re-asserts
-`L` on the next input event, so don't use them — Super+F2/F3 is the control.
+Note on the Fn keys: on this machine the EC handles Fn+F2/F3 (keyboard
+backlight) entirely in hardware and sends nothing to Linux, so they can't be
+used for control or OSD. Use Super+F2/F3 instead; the daemon re-asserts its
+level on the next input event if the EC keys are pressed.
 
 #### Install
 
@@ -791,25 +712,26 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now kbd-backlightd.service
 ```
 
-No Python dependencies — stdlib only.
+Add to `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + F2", "Keyboard brightness down", "kbd-backlight down", { locked = true })
+o.bind("SUPER + F3", "Keyboard brightness up", "kbd-backlight up", { locked = true })
+```
 
 #### Verify
 
 ```bash
 systemctl status kbd-backlightd.service
-journalctl -u kbd-backlightd -f        # shows the watched input devices
-
-kbd-backlight up                       # LED +1, OSD appears
-kbd-backlight down                     # LED -1
-cat /var/lib/kbd-backlightd/level      # matches the LED level
-
-# Hands off keyboard and touchpad for ~35s: LED turns off.
-# Type a key or touch the touchpad: instantly back at L.
+kbd-backlight up      # level +1, OSD appears
+kbd-backlight down    # level -1
+# Hands off keyboard and touchpad ~35s: backlight turns off.
+# Type or touch the touchpad: instantly back at your level.
 ```
 
 #### Configure
 
-Change the idle timeout (default 30s):
+Idle timeout (default 30s):
 
 ```bash
 sudo systemctl edit kbd-backlightd
