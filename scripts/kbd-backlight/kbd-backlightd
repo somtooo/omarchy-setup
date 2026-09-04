@@ -133,6 +133,10 @@ def main() -> None:
 
     L = load_L()
     last_input = time.monotonic()
+    # We have written nothing yet, but believe what the LED currently shows
+    # (e.g. systemd-backlight restored a level at boot) so the idle timer
+    # applies to it.
+    last_wrote = read_led()
     sel = selectors.DefaultSelector()
 
     try:
@@ -158,14 +162,19 @@ def main() -> None:
         sel.register(fd, selectors.EVENT_READ, "input")
         print(f"kbd-backlightd: watching {dev}", file=sys.stderr)
 
-    def on_input() -> None:
-        nonlocal last_input
+    def on_input(resumed: bool) -> None:
+        nonlocal last_input, last_wrote
+        if resumed:
+            # Sleep happened; the EC may have touched the LED behind our
+            # back. We are not in control during sleep: invalidate the cache.
+            last_wrote = None
         last_input = time.monotonic()
-        if L > 0 and read_led() == 0:
+        if L > 0 and last_wrote != L:
             write_led(L)
+            last_wrote = L
 
     def on_command() -> None:
-        nonlocal L, last_input
+        nonlocal L, last_input, last_wrote
         last_input = time.monotonic()  # the keypress that sent this is input
         conn, _ = srv.accept()
         try:
@@ -183,11 +192,17 @@ def main() -> None:
             return
         if L != old:
             save_L(L)
-        write_led(L)
+        write_led(L)   # unconditional: a deliberate press should always apply
+        last_wrote = L
         show_osd(L)
 
+    # Resume detection: time.monotonic() freezes during deep sleep while wall
+    # clock (time.time()) keeps running. A jump in their delta = we slept, so
+    # the LED cache is invalid (the EC is not under our control during sleep).
+    wall_mono_delta = time.time() - time.monotonic()
+
     while True:
-        lit = read_led() > 0
+        lit = last_wrote not in (None, 0)
         if lit:
             timeout = max(0.0, IDLE_SECS - (time.monotonic() - last_input))
         else:
@@ -201,11 +216,15 @@ def main() -> None:
                     pass
                 except OSError:
                     continue  # device vanished; select will keep failing
-                on_input()
+                new_delta = time.time() - time.monotonic()
+                resumed = abs(new_delta - wall_mono_delta) > 1.0
+                wall_mono_delta = new_delta
+                on_input(resumed)
             else:
                 on_command()
         if lit and time.monotonic() - last_input >= IDLE_SECS:
             write_led(0)
+            last_wrote = 0
 
 
 if __name__ == "__main__":

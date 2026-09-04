@@ -557,23 +557,36 @@ Two pieces of state, each with exactly one writer:
 | State | Meaning | Written by |
 |---|---|---|
 | `L` | the user's chosen level (0-3); 0 = user turned it off | **only** the `up`/`down`/`off` commands |
-| `last_input` | timestamp of last keyboard/touchpad activity | only input events |
+| `last_wrote` | the last value this daemon instance wrote to the LED | the daemon itself |
+
+The daemon never reads the LED register on the hot path — it tracks what it
+last wrote and trusts only that. The EC (which handles the hardware Fn keys
+and clears the backlight across suspend entirely behind Linux's back) is
+treated as what it is: an uncooperative device whose interference is undone,
+not tracked.
 
 Event handling:
 
 | Event | Action |
 |---|---|
-| input event | `last_input = now`; if `LED == 0 and L > 0`, write `L` to the LED (instant relight) |
-| `up` / `down` | `L = clamp(L ± 1, 0, 3)`; write LED; persist `L`; show OSD |
-| `off` | `L = 0`; write 0; persist; show OSD |
-| timer | if idle ≥ `IDLE_SECS` and LED > 0, write 0 |
+| input event | `last_input = now`; if `L > 0 and last_wrote != L`, write `L` (exactly one write) |
+| `up` / `down` | `L = clamp(L ± 1, 0, 3)`; persist; write LED; show OSD |
+| `off` | `L = 0`; persist; write 0; show OSD |
+| timer | if `last_wrote > 0` and idle ≥ `IDLE_SECS`, write 0; `last_wrote = 0` |
 
 Key properties:
 
-- **Suspend/resume needs no handling.** The EC (not Linux) clears the
-  backlight across sleep. After resume the LED is simply off, which is
-  indistinguishable from idle-off, so the first input event relights to `L`.
-  No logind/D-Bus listeners, no resume hooks.
+- **Suspend/resume = cache invalidation, nothing more.** The daemon freezes
+  with the system; on the first input event after a wall-clock/monotonic-clock
+  divergence (i.e. we slept), it sets `last_wrote = None` — "we were not in
+  control during sleep, so assume we wrote nothing" — and the next keystroke
+  writes `L` again. No logind hooks, no D-Bus listeners, no EC special-casing.
+  (Observed failure this fixes: after resume the LED register can read 2 while
+  the physical LEDs are dark — the EC dropped the write. Never trusting the
+  register sidesteps this entirely.)
+- **Normal typing costs zero sysfs writes** (`last_wrote == L` → skip).
+  Relight after idle or sleep costs exactly one write. Commands always write
+  (a deliberate press should always apply, even if the level didn't change).
 - **Hardware changes are never adopted into `L`.** The EC's own Fn-key
   handling (see below) and any other out-of-band writes only affect the LED
   until the next event re-asserts the invariant. One writer for intent, ever.
@@ -581,9 +594,9 @@ Key properties:
   `/var/lib/kbd-backlightd/level`. On startup the daemon reads it; if absent
   it adopts the current hardware level.
 - **Performance:** the hot path is `select()` wake → read one 24-byte
-  `input_event` → compare → one sysfs write. No subprocesses, no disk reads,
-  no polling. Relight latency is single-digit milliseconds; idle CPU is zero
-  (when dark the loop sleeps in `select()` with no timeout).
+  `input_event` → compare two integers in memory. No subprocesses, no disk
+  reads, no LED reads, no polling. When dark the loop sleeps in `select()`
+  with no timeout at all.
 
 #### The Fn key problem
 
