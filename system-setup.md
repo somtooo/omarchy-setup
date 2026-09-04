@@ -536,6 +536,14 @@ device instead; the touchpad is not grabbed by keyd and is read directly.
 The level is persisted in `/run/kbd-idle-level` (brightnessctl cannot be used
 here — it hangs on D-Bus when run as root).
 
+Suspend/resume edge case: the ASUS EC **clears the backlight across deep
+sleep**. The kernel reports EC-originated brightness changes through the
+LED's `brightness_hw_changed` uevent, so the daemon also runs
+`udevadm monitor --subsystem-match=leds`; when the hardware goes dark while
+the saved level is > 0 (i.e. the user never asked for off), it relights.
+Fn+F3/F4 still work because Omarchy handles them via software writes, which
+do not emit that uevent, so the two paths never fight.
+
 #### Install
 
 Scripts live in [`scripts/kbd-backlight-idle/`](scripts/kbd-backlight-idle/):
