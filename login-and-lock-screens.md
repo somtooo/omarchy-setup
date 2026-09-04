@@ -96,8 +96,8 @@ cp omarchy-setup/sddm-macos-theme/avatar.png ~/.local/share/login-look/
 The LockView references two user assets:
 
 - `~/.local/share/login-look/avatar.png` — circular avatar (256×256, transparent outside circle)
-- The blurred wallpaper comes from the plugin's own live blur of your current
-  background (no file needed)
+- `~/.local/share/login-look/lock-blur.jpg` — pre-blurred wallpaper, generated
+  by `scripts/sync-login-bg.sh` (run it after changing your wallpaper)
 
 Enable it (this disables the stock `omarchy.lock`):
 
@@ -110,6 +110,28 @@ If `omarchy plugin enable som2.lock` doesn't know the plugin yet, rescan first
 and retry. Lock the screen (Super+Esc → Lock) to see it.
 
 **Revert:** `omarchy plugin enable omarchy.lock` (the clone can stay in place).
+
+### Why the lock background is pre-blurred (resume-from-suspend speed)
+
+The stock plugin (and an earlier version of this clone) loaded the raw
+wallpaper and applied a live GPU blur (`MultiEffect`, blurMax 128) **at lock
+time** (`loadBackground: root.locked`). On resume-from-suspend that meant:
+decode a 4K JPEG + build a big GPU blur graph on a just-woken GPU before the
+first lock frame could commit — Hyprland shows its grey session-lock failsafe
+for ~3-4 seconds in the meantime.
+
+The clone now:
+
+- shows `lock-blur.jpg` (blur baked in offline by ImageMagick) with **no
+  runtime blur** — a plain decoded JPEG paints far sooner
+- loads it **synchronously with `cache: true`**, and `Service.qml` sets
+  `loadBackground: true` so the image is decoded when the shell starts, not
+  when you lock
+- adds a cheap translucent black overlay (`Qt.rgba(0,0,0,0.18)`) for
+  legibility instead of the blur's brightness/contrast tweaks
+
+Result: background, avatar, clock and password field all appear together on
+wake with no grey flash.
 
 ---
 
@@ -124,8 +146,9 @@ pkexec cp ~/devcave/login-customization/sddm-macos/background.jpg /usr/share/sdd
 (`sync-login-bg.sh` writes to `~/devcave/login-customization/` by default —
 edit the `OUT_DIR` variable at the top if you keep this repo elsewhere.)
 
-The lock screen blurs your live wallpaper itself, so it follows wallpaper
-changes automatically. Only the SDDM background needs the script + copy.
+The lock screen now uses the pre-blurred `lock-blur.jpg` from the script, so
+**both** screens need `sync-login-bg.sh` after a wallpaper change (the lock no
+longer follows wallpaper changes automatically).
 
 To change the avatar, replace `~/.local/share/login-look/avatar.png` (lock) and
 `/usr/share/sddm/themes/macos/avatar.png` (login). Generate a circular one from
