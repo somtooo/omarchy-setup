@@ -584,6 +584,54 @@ screen on (this looks stuck but is not — do not hard-reset), then power off.
 Resume shows the SDDM login (normal for encrypted hibernate). Raise or remove
 the drop-in once confirmed.
 
+#### 19.8 Hibernate writes the image but never powers off (fans/backlight stay on)
+
+> **Regression found 2026-09-04, fixed same day.** `systemctl hibernate` (and the
+> hibernate phase of suspend-then-hibernate) wrote the image — sessions restored
+> on next boot — but the laptop **stayed powered on** (fans spinning, sometimes
+> the backlight on) and had to be hard-powered-down. The journal shows the S4
+> power-off **aborting**:
+>
+> ```
+> ACPI: PM: Preparing to enter system sleep state S4
+> ACPI: PM: Waking up from system sleep state S4      ← bounces back immediately
+> PM: hibernation: hibernation exit                   ← aborts instead of cutting power
+> NVRM: gpuGc6EntryGpuPowerOff_IMPL: Call to power off GPU failed.
+> ```
+
+**Root cause.** `HibernateMode` defaults to `platform`, which asks the ACPI
+firmware to enter S4 and cut power. On this modern-standby (S0ix) board the
+NVIDIA dGPU refuses to enter its GC6 power-off state, so the platform S4
+transition aborts and the kernel "wakes" back out of S4 instead of powering
+down. The image is already safely on disk, so resume still works — but the
+machine never actually turns off.
+
+**Fix.** Use the `shutdown` hibernate mode: write the same resumable image, then
+power off via the normal kernel shutdown path instead of asking ACPI for S4:
+
+```bash
+pkexec bash -c 'cat > /etc/systemd/sleep.conf.d/hibernate-mode.conf << "EOF"
+[Sleep]
+HibernateMode=shutdown
+EOF'
+```
+
+Resume is identical (LUKS → SDDM → session restored). Verified 2026-09-04: the
+machine powers off by itself. To test before making it permanent, set the live
+value with `pkexec sh -c "echo shutdown > /sys/power/disk"`, confirm
+`cat /sys/power/disk` shows `[shutdown]`, then `systemctl hibernate`.
+
+#### 19.9 Sudo / lock-screen password "not working" — faillock temporary ban
+
+Not a hibernate problem, but it surfaced during this debugging: after many
+failed unlock/sudo attempts (hard-reset loops, retrying the lock screen while
+suspend was broken), PAM's `pam_faillock` (`deny=10 unlock_time=120` in
+`/etc/pam.d/system-auth` and `/etc/pam.d/omarchy-lock-password`) **bans the
+account for 120 s**. During the ban the *correct* password is rejected
+everywhere — sudo and the lock screen alike. It clears on its own after 2 min
+(`faillock --user $USER` shows the counter). If your password "stops working"
+during heavy testing, wait 2 minutes and retry before assuming it's wrong.
+
 #### 19.7 Suspend hangs when the screen is already locked (Omarchy lock-service crash loop)
 
 > **Regression 2026-09-04, fixed same day.** A *second* `suspend-then-hibernate`
