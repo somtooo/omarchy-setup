@@ -5,7 +5,9 @@ Rectangle {
   id: root
   width: 640
   height: 480
-  color: "#1a1b26"
+  // Matches the wallpaper's average color so the first frame (before the
+  // async-decoded image lands) is the same tone, not a black flash.
+  color: "#882a46"
 
   property string currentUser: userModel.lastUser
   property bool loginFailed: false
@@ -32,11 +34,20 @@ Rectangle {
     }
   }
 
-  // Blurred + darkened wallpaper (pre-rendered)
+  // Blurred + darkened wallpaper (pre-rendered).
+  // asynchronous + downscaled decode: the full 2560px JPEG used to decode on
+  // the UI thread, delaying the greeter's first frame (blank screen, then a
+  // late pop-in after resume-from-hibernate). Decode off-thread at screen
+  // resolution and fade in over the base color instead.
   Image {
     anchors.fill: parent
     source: "background.jpg"
     fillMode: Image.PreserveAspectCrop
+    asynchronous: true
+    sourceSize.width: Math.max(root.width, 1280)
+    sourceSize.height: Math.max(root.height, 1280)
+    opacity: status === Image.Ready ? 1 : 0
+    Behavior on opacity { NumberAnimation { duration: 250; easing.type: Easing.InOutQuad } }
   }
 
   Column {
