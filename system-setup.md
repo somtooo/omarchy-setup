@@ -15,7 +15,7 @@ or custom lid-switch instructions from older Omarchy releases.
 5. [UI Customization](#ui-customization)
 6. [Window Manager Configuration](#window-manager-configuration)
 7. [Login and Lock Screens](#login-and-lock-screens)
-8. [System Services](#system-services) — includes macOS-style safe sleep (19)
+8. [System Services](#system-services) — includes macOS-style safe sleep (19) and keyboard backlight idle-off (19b)
 9. [Backup Configuration](#backup-configuration)
 10. [Development Tools](#development-tools)
 11. [Audio Configuration](#audio-configuration)
@@ -503,6 +503,82 @@ journalctl -b 0 -k | grep -E "PM: hibernation|nvidia.*PM:"
 pkexec systemctl disable nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service
 pkexec rm /etc/modprobe.d/nvidia-hibernate.conf
 pkexec bash -c 'mv /etc/mkinitcpio.conf.d/nvidia.conf.disabled /etc/mkinitcpio.conf.d/nvidia.conf; limine-mkinitcpio'
+```
+
+### 19b. Dell-style Keyboard Backlight Idle-Off (ASUS)
+
+> **Hardware:** ASUS ROG Zephyrus G16 GU605CR, but works on any ASUS laptop
+> exposing `/sys/class/leds/asus::kbd_backlight`.
+> **Tested 2026-09-04:** backlight lights on keypress or touchpad touch at the
+> last Fn-set level, turns off after 30s idle, Fn+F3 down to 0 stays off.
+
+Unlike Dell laptops (whose EC turns the keyboard backlight on while typing and
+fades it out when idle), ASUS exposes only a raw brightness level
+(`asus::kbd_backlight`, levels 0-3) to Linux. asusctl v6 removed its old
+`awake` LED mode, so out of the box the backlight just stays on at whatever
+level Fn+F3/F4 set. This section installs a small dependency-free daemon that
+recreates the Dell behavior in userspace.
+
+Behavior:
+
+- Pressing any key **or touching the touchpad** lights the backlight at the
+  level last set with Fn+F3/F4.
+- After **30 seconds** with no keyboard or touchpad activity, the backlight
+  turns off.
+- Fn+F3/F4 still control the brightness level (handled by Omarchy's
+  `omarchy-brightness-keyboard` binding); pressing Fn+F3 down to 0 turns the
+  light off and it stays off until Fn+F4 is pressed.
+
+How it works: the daemon reads raw `input_event`s from the keyboard and
+touchpad devices with `dd` (no evtest/libinput dependency). Because **keyd**
+grabs the physical keyboard, the daemon watches the `keyd virtual keyboard`
+device instead; the touchpad is not grabbed by keyd and is read directly.
+The level is persisted in `/run/kbd-idle-level` (brightnessctl cannot be used
+here — it hangs on D-Bus when run as root).
+
+#### Install
+
+Scripts live in [`scripts/kbd-backlight-idle/`](scripts/kbd-backlight-idle/):
+
+```bash
+sudo install -Dm755 scripts/kbd-backlight-idle/kbd-idle-daemon /usr/local/bin/kbd-idle-daemon
+sudo install -Dm644 scripts/kbd-backlight-idle/kbd-idle-daemon.service /etc/systemd/system/kbd-idle-daemon.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now kbd-idle-daemon.service
+```
+
+#### Verify
+
+```bash
+systemctl status kbd-idle-daemon.service
+journalctl -u kbd-idle-daemon -f   # should show the watched keyboard + touchpad devices
+
+# Hands off keyboard and touchpad for ~35s:
+watch -n1 cat /sys/class/leds/asus::kbd_backlight/brightness   # drops to 0
+# Type a key or touch the touchpad: returns to previous level
+```
+
+#### Configure
+
+Change the idle timeout (default 30s) with a drop-in:
+
+```bash
+sudo systemctl edit kbd-idle-daemon
+```
+
+```ini
+[Service]
+Environment=IDLE_SECS=15
+```
+
+Then `sudo systemctl restart kbd-idle-daemon`.
+
+#### Uninstall
+
+```bash
+sudo systemctl disable --now kbd-idle-daemon.service
+sudo rm /usr/local/bin/kbd-idle-daemon /etc/systemd/system/kbd-idle-daemon.service
+sudo systemctl daemon-reload
 ```
 
 ### 20. Setup Btrfs Snapshots

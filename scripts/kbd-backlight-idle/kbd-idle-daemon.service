@@ -1,0 +1,12 @@
+[Unit]
+Description=Keyboard backlight idle-off daemon (ASUS)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/kbd-idle-daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
