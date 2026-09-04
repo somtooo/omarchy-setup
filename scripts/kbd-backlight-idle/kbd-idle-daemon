@@ -1,24 +1,38 @@
 #!/bin/bash
 # kbd-idle-daemon: Dell-style keyboard backlight for ASUS laptops on Linux.
 #
-# Control law, evaluated continuously:
+# Behavior:
+#   - Any keyboard or touchpad activity turns the backlight ON at level L.
+#   - IDLE_SECS without activity turns it OFF.
+#   - L changes ONLY via omarchy-brightness-keyboard (Super+F2/F3), through
+#     the shim at /usr/local/bin which records intent to INTENT_FILE.
+#     L = 0 means the user turned the backlight off; it then stays off
+#     (even while typing) until the user raises it again.
 #
-#     b(t) = L   if L > 0 and (now - last_input) < IDLE_SECS
-#     b(t) = 0   otherwise
-#
-# L = the user's chosen level (persisted in STATE_FILE). L = 0 means the
-# user turned the backlight off; the daemon then leaves it off until the
-# user picks a nonzero level again (Fn keys / any external write).
-#
-# External changes (Fn keys, EC reset on resume, brightnessctl, asusctl)
-# are adopted on the next tick: a nonzero b != L becomes the new L, and a
-# zero b while the user is active becomes L = 0. No flags, no edge
-# detection — the loop is idempotent and converges from any disturbance.
+# The daemon NEVER writes L itself: external brightness changes (EC resets
+# on suspend/lid, brightnessctl, Fn keys handled in hardware) cannot corrupt
+# user intent — they only affect the current hardware level until the next
+# input event re-asserts L.
 
 IDLE_SECS="${IDLE_SECS:-30}"
 LED_PATH="/sys/class/leds/asus::kbd_backlight"
-STATE_FILE=/run/kbd-idle-level
 LAST_EVENT_FILE=/run/kbd-idle-last
+
+# Find the intent file (written by the omarchy-brightness-keyboard shim in
+# the user's runtime dir). Re-resolve every read: the shim may appear after
+# the daemon starts.
+get_L() {
+  local v
+  for d in /run/user/*; do
+    if [[ -e $d/kbd-backlight-intent ]]; then
+      v=$(cat "$d/kbd-backlight-intent" 2>/dev/null)
+      break
+    fi
+  done
+  # No recorded intent yet: adopt whatever the hardware currently shows.
+  [[ -z $v ]] && v=$(get_b)
+  echo "${v:-1}"
+}
 
 # Find input devices: prefer the keyd virtual keyboard if keyd is running
 # (keyd grabs the physical keyboard), otherwise fall back to the i8042
@@ -47,23 +61,20 @@ echo "kbd-idle-daemon: watching keyboard=$KBD_DEV touchpad=${TPAD_DEV:-none}, id
 
 get_b() { local v; v=$(cat "$LED_PATH/brightness" 2>/dev/null); echo "${v:-0}"; }
 set_b() { echo "$1" > "$LED_PATH/brightness" 2>/dev/null; }
-get_L() { local v; v=$(cat "$STATE_FILE" 2>/dev/null); echo "${v:-1}"; }
-set_L() { echo "$1" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"; }
 last_event() { local v; v=$(cat "$LAST_EVENT_FILE" 2>/dev/null); echo "${v:-$EPOCHSECONDS}"; }
-stamp() { echo "$EPOCHSECONDS" > "$LAST_EVENT_FILE.tmp" && mv "$LAST_EVENT_FILE.tmp" "$LAST_EVENT_FILE"; }
 
-# Initialize: adopt current brightness as the level (default 1 if dark).
-b=$(get_b)
-if (( b > 0 )); then set_L "$b"; else [[ -e $STATE_FILE ]] || set_L 1; fi
-stamp
-
-# Input watchers: each 24-byte input_event read = activity. Just stamp the
-# clock; the control loop does the rest on its next tick.
+# Watcher: each 24-byte input_event read = activity. Stamp the clock, then
+# relight ONLY if the light is currently off — never touch a lit backlight,
+# so brightness changes (Super+F2/F3) are never fought.
 watcher() {
-  local dev=$1
+  local dev=$1 tmp="$LAST_EVENT_FILE.w$$"
   while true; do
     while dd if="$dev" bs=24 count=1 status=none iflag=fullblock of=/dev/null 2>/dev/null; do
-      stamp
+      echo "$EPOCHSECONDS" > "$tmp" && mv -f "$tmp" "$LAST_EVENT_FILE"
+      if (( $(get_b) == 0 )); then
+        L=$(get_L)
+        (( L > 0 )) && set_b "$L"
+      fi
     done
     sleep 1
   done
@@ -76,48 +87,15 @@ if [[ -n $TPAD_DEV && -e $TPAD_DEV ]]; then
   PIDS="$PIDS $!"
 fi
 
-cleanup() { kill $PIDS 2>/dev/null; rm -f "$LAST_EVENT_FILE" "$LAST_EVENT_FILE.tmp" "$STATE_FILE.tmp"; }
+cleanup() { kill $PIDS 2>/dev/null; rm -f "$LAST_EVENT_FILE" "$LAST_EVENT_FILE".*; }
 trap cleanup EXIT
 
-# Control loop.
-# Start with we_turned_it_off=1: darkness present at startup (boot, service
-# restart after a crash, resume with a fresh process) is system-caused, not
-# a manual user-off, so it must never zero L.
-we_turned_it_off=1
-prev_now=$EPOCHSECONDS
+# Tick loop: enforces the idle timeout only.
 while true; do
   sleep 2
   b=$(get_b)
-  L=$(get_L)
-  le=$(last_event)
-  a=$(( EPOCHSECONDS - le ))
-
-  # Suspend/resume detection: wall clock jumped far beyond our sleep interval.
-  # Treat any current darkness as system-caused (EC clears the backlight on
-  # resume), not as a manual user-off.
-  if (( EPOCHSECONDS - prev_now > IDLE_SECS )); then
-    we_turned_it_off=1
-  fi
-  prev_now=$EPOCHSECONDS
-
-  # Adopt external changes.
-  if (( b > 0 && b != L )); then
-    set_L "$b"; L=$b
-  elif (( b == 0 && L > 0 && a < IDLE_SECS && we_turned_it_off == 0 )); then
-    # Active user, light went dark, we didn't do it: user turned it off.
-    set_L 0; L=0
-  fi
-
-  # Enforce the control law.
-  if (( L > 0 && a < IDLE_SECS )); then desired=$L; else desired=0; fi
-  if (( b != desired )); then
-    set_b "$desired"
-    # Remember "we turned it off" until we relight, so darkness we created
-    # is not mistaken for a manual user-off on a later tick.
-    if (( desired == 0 )); then we_turned_it_off=1; fi
-  fi
-  if (( we_turned_it_off == 1 && desired > 0 && b == 0 )); then
-    # We just relit (this tick or a prior one): flag has served its purpose.
-    we_turned_it_off=0
+  a=$(( EPOCHSECONDS - $(last_event) ))
+  if (( b > 0 && a >= IDLE_SECS )); then
+    set_b 0
   fi
 done
