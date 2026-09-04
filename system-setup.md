@@ -568,6 +568,62 @@ the defaults are correct. (To shorten the 2h delay, an optional drop-in is
 phase uses the default sleep state (now s2idle again). The broken `deep` path
 only ever affected the suspend phase.
 
+**Testing note.** To verify suspend-then-hibernate, set a short delay:
+
+```bash
+pkexec bash -c 'mkdir -p /etc/systemd/sleep.conf.d && cat > /etc/systemd/sleep.conf.d/hibernate-delay.conf << "EOF"
+[Sleep]
+HibernateDelaySec=3min
+EOF'
+```
+
+Then run `systemctl suspend-then-hibernate` (NOT `systemctl suspend` — that verb
+is hardcoded to plain suspend and bypasses the logind preference). Expect:
+sleep in a few seconds, self-wake at 3 min, ~4 min writing the image with the
+screen on (this looks stuck but is not — do not hard-reset), then power off.
+Resume shows the SDDM login (normal for encrypted hibernate). Raise or remove
+the drop-in once confirmed.
+
+#### 19.7 Suspend hangs when the screen is already locked (Omarchy lock-service crash loop)
+
+> **Regression 2026-09-04, fixed same day.** A *second* `suspend-then-hibernate`
+> hung with the screen on, never reached `suspend entry`, requiring a hard
+> reset. The **first** suspend worked. Unrelated to nvidia, sleep state, or
+> hibernate — the journal never left userspace.
+
+**Root cause.** Upstream Omarchy 4.0.2 bug. `omarchy-sleep-lock.service`
+(lock-screen-before-suspend monitor) runs a persistent
+`systemd-inhibit --what=sleep --mode=delay` lock as its main process. When the
+session is **already locked** (e.g. the idle timer locked it before suspend
+fired — exactly what the 3-minute test invites), a fresh inhibit fails with
+`Failed to inhibit: The operation inhibition has been requested for is already
+running`, the service exits 1, and the unit's `Restart=always` +
+`StartLimitAction=none` restart it **forever** (35+ restarts in ~48 s observed).
+Each attempt holds a sleep delay-inhibitor, so `systemd-suspend` waits on it
+indefinitely → the machine sits powered-on, never sleeping. Suspending unlocked
+is the designed fallback (the lock script reports it); the infinite hang is the
+bug.
+
+**Fix.** A drop-in that bounds the restart loop so the service fails fast and
+suspend proceeds, instead of hanging the machine:
+
+```bash
+pkexec bash -c 'mkdir -p /etc/systemd/user/omarchy-sleep-lock.service.d && cat > /etc/systemd/user/omarchy-sleep-lock.service.d/no-crash-loop.conf << "EOF"
+[Unit]
+StartLimitIntervalSec=30
+StartLimitBurst=10
+
+[Service]
+StartLimitAction=none
+RestartSec=1
+EOF'
+systemctl --user daemon-reload
+```
+
+With this, if the lock cannot be acquired the unit gives up after ~10 s and
+suspend continues (unlocked), rather than the machine hanging. This is a
+workaround for an upstream defect; re-check after Omarchy updates.
+
 ### 19b. Dell-style Keyboard Backlight Idle-Off (ASUS)
 
 > **Hardware:** ASUS ROG Zephyrus G16 GU605CR, but works on any ASUS laptop
