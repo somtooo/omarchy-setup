@@ -1,0 +1,565 @@
+#!/usr/bin/env python
+"""
+quattrobar-autohide — Hyprland autohide controller for the Omarchy Quattro bar
+===============================================================================
+
+Hides the Omarchy Quattro (Quickshell) bar when a window overlaps the bar
+area, shows it when the cursor reaches the top edge or no window overlaps.
+Designed for Omarchy 4 "Quattro" on Hyprland.
+
+HOW IT WORKS
+------------
+The main loop polls Hyprland every QUATTROBAR_AUTOHIDE_REFRESH_RATE seconds
+and computes the desired bar state (VISIBLE or HIDDEN) from two signals:
+
+  1. Cursor proximity: if the cursor is within BAR_HEIGHT px of the top of
+     any tracked monitor, show the bar.
+  2. Window overlap: if any mapped, non-hidden, non-fullscreen window on an
+     active workspace has its top edge within (BAR_HEIGHT + HEIGHT_THRESHOLD)
+     px of the screen top, hide the bar.
+
+Visibility is controlled through Omarchy's `bar-off` toggle flag (the same
+mechanism as `omarchy toggle bar`): the QML bar parks itself past the screen
+edge and stops reserving space while the flag exists, so showing again is
+just a margin change — cheap enough to flip every poll. After each flag
+change the shell is nudged via `omarchy-shell -q som2.bar syncHidden`
+because its directory watch can miss rapid flag flips.
+
+MONITOR ADD / LID OPEN HANDLING
+--------------------------------
+When a new monitor is added (e.g. opening a laptop lid while docked), Hyprland
+fires a `monitoradded` IPC event and the shell takes a moment to build the
+bar surface on the new output. Hiding immediately risks parking a bar that
+does not exist yet and confusing the internal state.
+
+The fix uses a two-phase grace mechanism driven by Hyprland's socket2 events:
+
+  Phase 1 — monitoradded / monitoraddedv2:
+    Set _monitor_grace = True. The main loop returns VISIBLE unconditionally
+    while Hyprland initializes the new display and the shell creates its
+    layer surface.
+
+  Phase 2 — first openlayer>> event:
+    Fired when a layer surface opens on the new output. Clears
+    _monitor_grace and sets _force_resync.
+
+  Force resync:
+    When grace clears, the script's internal state may already say HIDDEN
+    from before the lid opened while the bar was force-shown during grace.
+    _force_resync causes the main loop to unconditionally re-apply the
+    correct state on the next iteration, resynchronizing the script with
+    the bar's actual visual state.
+
+IPC SOCKET RESILIENCE
+---------------------
+The socket path includes HYPRLAND_INSTANCE_SIGNATURE, which changes if
+Hyprland restarts. get_hyprland_socket2() is called inside the reconnect
+loop (not once at startup) so the thread automatically picks up the new
+socket path after a Hyprland restart without requiring a restart of this
+script.
+
+ENVIRONMENT VARIABLES
+---------------------
+  QUATTROBAR_AUTOHIDE_BAR_HEIGHT       px height of the bar (default: 26)
+  QUATTROBAR_AUTOHIDE_HEIGHT_THRESHOLD extra px below bar to trigger hide (default: 20)
+  QUATTROBAR_AUTOHIDE_REFRESH_RATE     poll interval in seconds (default: 0.25)
+  QUATTROBAR_AUTOHIDE_MONITORS         comma-separated monitor IDs to track;
+                                        empty = all monitors (default: empty)
+
+LOGGING
+-------
+Logs to /tmp/quattrobar-autohide.log at INFO level.
+"""
+
+import json
+import logging
+import os
+import signal
+import socket
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, fields
+from enum import StrEnum
+from pathlib import Path
+from typing import Callable, Iterator, List, Optional, Tuple
+
+
+BAR_HEIGHT = int(os.getenv("QUATTROBAR_AUTOHIDE_BAR_HEIGHT", "34"))
+HEIGHT_THRESHOLD = int(os.getenv("QUATTROBAR_AUTOHIDE_HEIGHT_THRESHOLD", "20"))
+SUBPROCESS_TIMEOUT = 5  # seconds
+SHELL_WAIT_TIMEOUT = 60  # seconds to wait for the shell at startup
+BAR_OFF_FLAG = Path.home() / ".local" / "state" / "omarchy" / "toggles" / "bar-off"
+LOG_FILE = Path("/tmp/quattrobar-autohide.log")
+
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+    ],
+)
+log = logging.getLogger(__name__)
+
+
+# Global for graceful shutdown
+running = True
+
+# Grace period state — see module docstring for full explanation.
+_monitor_grace: bool = False
+_grace_lock = threading.Lock()
+_force_resync: bool = False
+
+
+def set_monitor_grace():
+    global _monitor_grace
+    with _grace_lock:
+        _monitor_grace = True
+    log.info("monitoradded: grace period started, keeping bar visible")
+
+
+def clear_monitor_grace():
+    global _monitor_grace, _force_resync
+    with _grace_lock:
+        _monitor_grace = False
+        _force_resync = True
+    log.info("openlayer: grace period cleared, resuming autohide")
+
+
+def in_grace_period() -> bool:
+    with _grace_lock:
+        return _monitor_grace
+
+
+def consume_force_resync() -> bool:
+    """Returns True (and clears the flag) if a resync was requested."""
+    global _force_resync
+    with _grace_lock:
+        if _force_resync:
+            _force_resync = False
+            return True
+        return False
+
+
+def get_hyprland_socket2() -> Optional[Path]:
+    """
+    Find the Hyprland IPC event socket (socket2) path. Re-resolved on every
+    reconnect so a Hyprland restart (new HYPRLAND_INSTANCE_SIGNATURE) is
+    picked up automatically.
+    """
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        return None
+    uid = os.getuid()
+    candidates = [
+        Path(f"/run/user/{uid}/hypr/{sig}/.socket2.sock"),
+        Path(f"/tmp/hypr/{sig}/.socket2.sock"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def monitor_ipc_events():
+    """
+    Background thread: stream Hyprland IPC events and manage the grace period
+    around monitor add/remove events. `monitoradded` forces the bar visible
+    while the new output initializes; the first `openlayer` event afterwards
+    ends the grace and requests a resync.
+    """
+    global running
+
+    while running:
+        sock_path = get_hyprland_socket2()
+        if sock_path is None:
+            log.warning("Could not find Hyprland socket2 — retrying in 2s...")
+            time.sleep(2)
+            continue
+
+        try:
+            log.info(f"Listening for Hyprland IPC events on {sock_path}")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.connect(str(sock_path))
+                sock.settimeout(1.0)
+                buf = ""
+                while running:
+                    try:
+                        data = sock.recv(4096).decode("utf-8", errors="replace")
+                        if not data:
+                            break
+                        buf += data
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            line = line.strip()
+                            if line.startswith("monitoradded>>") or line.startswith("monitoraddedv2>>"):
+                                monitor_name = line.split(">>", 1)[1]
+                                log.info(f"monitoradded event: {monitor_name}")
+                                set_monitor_grace()
+                            elif line.startswith("openlayer>>"):
+                                clear_monitor_grace()
+                    except socket.timeout:
+                        continue
+        except Exception as e:
+            if running:
+                log.warning(f"IPC listener error: {e}, reconnecting in 2s...")
+                time.sleep(2)
+
+
+def signal_handler(signum, frame):
+    """Handle SIGTERM/SIGINT for graceful shutdown."""
+    global running
+    running = False
+    log.info(f"Received signal {signum}, shutting down...")
+    # Show the bar before exiting so it's not left hidden
+    show_bar()
+
+
+class BarState(StrEnum):
+    VISIBLE = "1"
+    HIDDEN = "0"
+
+
+class BaseModel:
+    @classmethod
+    def model_validate(cls, data: dict):
+        field_names = {(f.name, f.type) for f in fields(cls)}
+        filtered_data = {}
+
+        for field_name, field_type in field_names:
+            if field_name not in data:
+                continue
+
+            if isinstance(field_type, type) and issubclass(field_type, BaseModel):
+                filtered_data[field_name] = field_type.model_validate(data[field_name])
+            elif isinstance(field_type, type):
+                filtered_data[field_name] = field_type(data[field_name])
+            else:
+                filtered_data[field_name] = data[field_name]
+
+        return cls(**filtered_data)
+
+
+@dataclass
+class Workspace(BaseModel):
+    id: int
+    name: str
+
+
+@dataclass
+class HyprlandClient(BaseModel):
+    address: str
+    mapped: bool
+    hidden: bool
+
+    at: Tuple[int, int]
+    size: Tuple[int, int]
+
+    workspace: Workspace
+    monitor: int
+    fullscreen: int
+
+
+def is_bar_hidden() -> bool:
+    return BAR_OFF_FLAG.exists()
+
+
+def is_hyprland_running() -> bool:
+    result = subprocess.run(
+        ["hyprctl", "version"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def is_shell_running() -> bool:
+    result = subprocess.run(
+        ["pgrep", "-x", "quickshell"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def _sync_shell_hidden_state():
+    # The shell's directory watch can miss rapid flag changes; nudge it to
+    # re-read the flag. Quiet best-effort: fine when the shell is not up yet.
+    subprocess.run(
+        ["omarchy-shell", "-q", "som2.bar", "syncHidden"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def hide_bar():
+    """Park the bar off screen via the bar-off flag."""
+    try:
+        BAR_OFF_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        BAR_OFF_FLAG.touch(exist_ok=True)
+    except OSError as e:
+        log.warning(f"could not create bar-off flag: {e}")
+        return
+    _sync_shell_hidden_state()
+
+
+def show_bar():
+    """Bring the bar back by removing the bar-off flag."""
+    try:
+        BAR_OFF_FLAG.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning(f"could not remove bar-off flag: {e}")
+        return
+    _sync_shell_hidden_state()
+
+
+def set_bar_visibility(state: BarState):
+    """Set bar visibility to the given state (idempotent)."""
+    if state == BarState.VISIBLE:
+        if is_bar_hidden():
+            show_bar()
+    else:
+        if not is_bar_hidden():
+            hide_bar()
+
+
+def get_current_workspace() -> list[int]:
+    """Return the active workspace ID for every active monitor."""
+    try:
+        workspaces = subprocess.check_output(
+            "hyprctl monitors -j | jq '.[] | .activeWorkspace.id'",
+            shell=True,
+            text=True,
+            timeout=SUBPROCESS_TIMEOUT,
+        )
+        return [int(workspace.strip()) for workspace in workspaces.strip().split("\n") if workspace.strip()]
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
+        return []
+
+
+def get_monitor_from_position(pos_x: int, pos_y: int) -> Optional[int]:
+    """Return the monitor ID that contains the given screen coordinates."""
+    try:
+        monitors = json.loads(subprocess.check_output(
+            ["hyprctl", "-j", "monitors"],
+            timeout=SUBPROCESS_TIMEOUT,
+        ))
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+
+    for monitor in monitors:
+        start_x, end_x = monitor["x"], monitor["x"] + monitor["width"]
+        start_y, end_y = monitor["y"], monitor["y"] + monitor["height"]
+
+        if pos_x < start_x or pos_x > end_x:
+            continue
+
+        if pos_y < start_y or pos_y > end_y:
+            continue
+
+        return int(monitor["id"])
+
+    return None
+
+
+def get_clients(
+    filter_func: Callable[[HyprlandClient], bool] | None = None,
+) -> Iterator[HyprlandClient]:
+    """Yield all Hyprland clients, optionally filtered."""
+    try:
+        raw_clients = json.loads(subprocess.check_output(
+            ["hyprctl", "-j", "clients"],
+            timeout=SUBPROCESS_TIMEOUT,
+        ))
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return
+
+    for c in raw_clients:
+        try:
+            client = HyprlandClient.model_validate(c)
+            if filter_func is None or filter_func(client):
+                yield client
+        except (KeyError, TypeError, ValueError):
+            continue
+
+
+def get_overlapping_clients(
+    active_workspaces: list[int],
+    monitors: list[int] | None = None,
+) -> Iterator[HyprlandClient]:
+    """
+    Yield clients whose top edge is within (BAR_HEIGHT + HEIGHT_THRESHOLD) px
+    of the monitor top, meaning they overlap or nearly overlap the bar area.
+
+    Skips unmapped, hidden, fullscreen, and off-workspace clients.
+    """
+    def overlaps_bar(c: HyprlandClient) -> bool:
+        if not c.mapped:
+            return False
+        if c.hidden:
+            return False
+        if c.fullscreen:
+            return False
+        if c.monitor not in (monitors or [c.monitor]):
+            return False
+        if c.workspace.id not in active_workspaces:
+            return False
+
+        x, y = c.at
+        w, h = c.size
+
+        return y < (BAR_HEIGHT + HEIGHT_THRESHOLD) and (y + h) > 0
+
+    return get_clients(overlaps_bar)
+
+
+def window_overlaps_bar(
+    active_workspaces: list[int], monitors: List[int] | None = None
+) -> bool:
+    return any(get_overlapping_clients(active_workspaces, monitors))
+
+
+def get_cursor_position() -> Optional[Tuple[int, int]]:
+    """Return the current cursor position as (x, y), or None on failure."""
+    try:
+        output = subprocess.check_output(
+            ["hyprctl", "cursorpos"],
+            timeout=SUBPROCESS_TIMEOUT,
+        ).decode()
+        parts = output.strip().split(",")
+        if len(parts) != 2:
+            return None
+        return int(parts[0].strip()), int(parts[1].strip())
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def cursor_aproaches_bar(
+    monitors: list[int] | None, current_state: BarState
+) -> bool:
+    """
+    Return True if the cursor is close enough to the top of a tracked monitor
+    to trigger the bar to show.
+
+    When the bar is visible, the threshold is BAR_HEIGHT (cursor must be within
+    the bar itself). When hidden, the threshold is 0 (cursor must be at y=0,
+    i.e. the very top pixel) to avoid accidental triggers.
+    """
+    pos = get_cursor_position()
+    if pos is None:
+        return False
+
+    x, y = pos
+    cursor_monitor = get_monitor_from_position(x, y)
+    if cursor_monitor is None or cursor_monitor not in (monitors or [cursor_monitor]):
+        return False
+
+    offset = BAR_HEIGHT if current_state == BarState.VISIBLE else 0
+
+    return y <= offset
+
+
+def get_next_state(
+    bar_monitors: list[int], current_state: BarState
+) -> BarState:
+    """
+    Compute the desired bar visibility state.
+
+    Priority order:
+      1. Grace period active → VISIBLE (protect against blank screen on monitor add)
+      2. Cursor near top of screen → VISIBLE
+      3. Window overlaps bar area → HIDDEN
+      4. Otherwise → VISIBLE
+    """
+    if in_grace_period():
+        return BarState.VISIBLE
+
+    cursor_aproaches = cursor_aproaches_bar(bar_monitors, current_state)
+
+    if cursor_aproaches:
+        return BarState.VISIBLE
+
+    active_workspaces = get_current_workspace()
+    overlaps = window_overlaps_bar(active_workspaces, bar_monitors)
+
+    if overlaps:
+        return BarState.HIDDEN
+
+    return BarState.VISIBLE
+
+
+def main():
+    global running
+
+    # Setup signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    bar_monitors = os.environ.get("QUATTROBAR_AUTOHIDE_MONITORS", None)
+    if bar_monitors is not None:
+        bar_monitors = bar_monitors.split(",")
+        bar_monitors = [int(m.strip()) for m in bar_monitors if m.strip()]
+    else:
+        bar_monitors = []
+
+    refresh_rate = float(os.environ.get("QUATTROBAR_AUTOHIDE_REFRESH_RATE", "0.25"))
+
+    if not is_hyprland_running():
+        log.error("Hyprland is not running. Exiting.")
+        return
+
+    # Start IPC event listener thread for monitoradded grace period.
+    ipc_thread = threading.Thread(target=monitor_ipc_events, daemon=True)
+    ipc_thread.start()
+
+    log.info("Waiting for omarchy-shell to start...")
+
+    wait_start = time.time()
+    while not is_shell_running():
+        if time.time() - wait_start > SHELL_WAIT_TIMEOUT:
+            log.error(f"omarchy-shell did not start within {SHELL_WAIT_TIMEOUT}s. Exiting.")
+            return
+        time.sleep(0.5)
+
+    # Adopt the bar's actual on-disk state so a manual `omarchy toggle bar`
+    # before startup is respected instead of immediately overridden.
+    state: BarState = BarState.HIDDEN if is_bar_hidden() else BarState.VISIBLE
+    log.info(f"omarchy-shell detected. Starting autohide loop (initial state: {state}).")
+
+    while running:
+        try:
+            if not is_shell_running():
+                log.warning("omarchy-shell stopped. Waiting for restart...")
+                while not is_shell_running() and running:
+                    time.sleep(0.5)
+                if not running:
+                    break
+                # The shell restart re-reads the flag; resync from disk again.
+                state = BarState.HIDDEN if is_bar_hidden() else BarState.VISIBLE
+                log.info(f"omarchy-shell restarted. State reset to {state}.")
+                continue
+
+            next_state = get_next_state(bar_monitors, state)
+
+            # Apply state if it changed, OR if a force resync was requested
+            # (set when the monitor grace period clears). The setter is
+            # idempotent: it checks the flag before touching the shell.
+            if next_state != state or consume_force_resync():
+                set_bar_visibility(next_state)
+                state = next_state
+
+        except Exception as e:
+            # Log but don't crash on unexpected errors
+            log.exception(f"Error in main loop: {e}")
+
+        time.sleep(refresh_rate)
+
+    # Ensure the bar is visible before exiting
+    show_bar()
+    log.info("Shutting down gracefully.")
+
+
+if __name__ == "__main__":
+    main()

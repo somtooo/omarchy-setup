@@ -322,6 +322,27 @@ Then autostart it from `~/.config/hypr/autostart.lua`:
 o.launch_on_start("quattrobar-autohide")
 ```
 
+> **With the pill bar clone (below):** use the patched copy at
+> `scripts/quattrobar-autohide` in this repo — it nudges `som2.bar` (not
+> `omarchy.bar`) after flag flips and accounts for the pill's extra height.
+
+### 15b. Floating Pill Bar (som2.bar)
+
+The status bar is a user plugin clone of `omarchy.bar` restyled as a
+floating frosted-glass pill (rounded ends, 4px margins, drop shadow,
+double-tap transparency preserved). Full details in
+[bar-plugin.md](bar-plugin.md).
+
+```bash
+mkdir -p ~/.config/omarchy/plugins/som2.bar
+cp -r bar-plugin/Bar.qml bar-plugin/BarModel.js bar-plugin/manifest.json \
+      bar-plugin/widgets bar-plugin/indicators \
+      ~/.config/omarchy/plugins/som2.bar/
+omarchy plugin enable som2.bar
+omarchy plugin disable omarchy.bar
+omarchy restart shell
+```
+
 ### 16. Clipboard History
 
 Omarchy 4 includes a native clipboard manager. It records text and image
