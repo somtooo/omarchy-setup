@@ -390,121 +390,101 @@ separate legacy suspend or hypridle service.
 
 ### 19. Fix NVIDIA Hibernation Resume
 
-> **Hardware:** ASUS ROG Zephyrus G16 GU605CR (Intel Core Ultra 9 285H + NVIDIA RTX 5070 Ti, 32 GiB RAM, hybrid Intel iGPU + NVIDIA dGPU, Limine UKI, encrypted Btrfs `/` on `/dev/mapper/root` with `/swap/swapfile`).
-> **Note:** An earlier draft of this section added `suspend-then-hibernate`/`2h` `HibernateDelaySec` + logind lid drop-ins. **Removed 2026-09-03** — that behavior is not part of Omarchy 4 defaults. **Only the NVIDIA fix is kept.**
+> **Hardware:** ASUS ROG Zephyrus G16 GU605CR (Intel Core Ultra 9 285H + NVIDIA RTX 5070 Ti Mobile (GB205M), 32 GiB RAM, hybrid Intel iGPU + NVIDIA dGPU, Limine UKI, encrypted Btrfs `/` on `/dev/mapper/root` with `/swap/swapfile`).
+> **Note:** Earlier drafts of this section (a) added `suspend-then-hibernate`/lid drop-ins and (b) edited package-owned files in `/usr/lib/modprobe.d/`. All **reverted 2026-09-03** — the final fix below changes only `/etc/mkinitcpio.conf.d/`, survives package updates, and keeps Omarchy 4 defaults otherwise untouched.
 
 #### 19.1 What broke (2026-09-01 — 2026-09-03)
 
-On `2026-09-01 21:31:54` `systemd-logind[999]: hibernate requested` succeeded (`journalctl -b -1`):
+Hibernation entered cleanly (`journalctl -b -1`):
 
 ```
-systemd[1]: Starting System Hibernate...
+systemd-logind[999]: hibernate requested from client ... ('systemctl')
 systemd-sleep[268539]: Performing sleep operation 'hibernate'...
 kernel: PM: hibernation: hibernation entry
 ```
 
-On next boot `2026-09-03 18:40:19` (`journalctl -b 0 -k`) the image was found and fully re-loaded, then aborted:
+On next boot the image was found, fully loaded, then discarded (`journalctl -b 0 -k`):
 
 ```
 kernel: PM: Image signature found, resuming
 kernel: PM: hibernation: resume from hibernation
 kernel: PM: Loading and decompressing image data (2341251 pages)...
 kernel: PM: Image loading progress: 100%
-kernel: PM: Image loading done
-kernel: PM: hibernation: Read 9365004 kbytes in 11.77 seconds (795.66 MB/s)
 kernel: PM: Image successfully loaded
 kernel: NVRM: GPU 0000:01:00.0: PreserveVideoMemoryAllocations module parameter is set. System Power Management attempted without driver procfs suspend interface.
 kernel: nvidia 0000:01:00.0: PM: pci_pm_freeze(): nv_pmops_freeze [nvidia] returns -5
+kernel: nvidia 0000:01:00.0: PM: dpm_run_callback(): pci_pm_freeze returns -5
+kernel: nvidia 0000:01:00.0: PM: failed to quiesce async: error -5
 kernel: PM: hibernation: Failed to load image, recovering.
 kernel: PM: hibernation: resume failed (-5)
 ```
 
-**Root cause:** The open kernel module (`nvidia-open-dkms` 610.57.04) has a bug in `nv_pmops_freeze()`: it calls `nvidia_suspend(dev, NV_PM_ACTION_HIBERNATE, NV_FALSE)` with `is_procfs_suspend=NV_FALSE` hardcoded. When `NVreg_PreserveVideoMemoryAllocations=1` (`/usr/lib/modprobe.d/gsr-nvidia.conf:1`), this always hits the preserve check and returns `-5`, discarding the hibernation image.
+The machine then booted normally (looks like a plain shutdown).
 
-`NVreg_UseKernelSuspendNotifiers=1` (`/usr/lib/modprobe.d/nvidia-sleep.conf:1`) was also tried, but it prevents `/proc/driver/nvidia/suspend` from being created (`nv-procfs.c`: `if (NVreg_UseKernelSuspendNotifiers) create_suspend_file = NV_FALSE`), so `nvidia-sleep.sh` exits 0 (no-op) even when the systemd services are enabled.
+#### 19.2 Root cause (confirmed in 610.57.04 source + NVIDIA README)
 
-#### 19.2 Fix applied (2026-09-03) — minimal, Omarchy defaults untouched
+Chain of failure:
 
-**Step 1: Enable NVIDIA suspend/hibernate helpers**
+1. `gpu-screen-recorder` ships `/usr/lib/modprobe.d/gsr-nvidia.conf` with `options nvidia NVreg_PreserveVideoMemoryAllocations=1`.
+2. Omarchy early-loads the nvidia modules via `/etc/mkinitcpio.conf.d/nvidia.conf` (`MODULES+=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)`) — **early KMS**.
+3. In the open kernel module (`nvidia-open-dkms` 610.57.04), `nvidia_suspend()` rejects any PM action with `NV_ERR_NOT_SUPPORTED` when `preserve_vidmem_allocations && !is_procfs_suspend`, and `nv_pmops_freeze()` hardcodes `is_procfs_suspend=NV_FALSE` (`kernel-open/nvidia/nv.c`). So hibernate entry writes the image, but on the next boot the fresh nvidia driver in the initramfs refuses to quiesce → `pci_pm_freeze` returns `-5` (`EIO`) → the kernel discards the loaded image and recovers into a normal boot.
+4. The `nvidia-sleep.sh` / `/proc/driver/nvidia/suspend` path (the documented fix for the proprietary driver) cannot help here: `/usr/lib/modprobe.d/nvidia-sleep.conf` sets `NVreg_UseKernelSuspendNotifiers=1`, and with that the open module does not even create `/proc/driver/nvidia/suspend` (`nv-procfs.c`: `if (NVreg_UseKernelSuspendNotifiers) create_suspend_file = NV_FALSE`). Enabling `nvidia-{suspend,hibernate,resume}.service` is therefore a no-op on this driver. (Verified: with services enabled, hibernate still failed identically at `19:57→19:59`, and `ls /proc/driver/nvidia/suspend` → no such file.)
+5. Per NVIDIA README 610.57.04: with open kernel modules, preservation "is handled automatically if `NVreg_UseKernelSuspendNotifiers=1` is enabled" — **but** ArchWiki adds the critical caveat: with early KMS the module loads in the initramfs, which "has no access to `NVreg_TemporaryFilePath` which stores the previous video memory: early KMS should not be used if hibernation is desired." The initramfs also lacks writable `/var/tmp`, so the automatic path cannot function either.
 
-```bash
-pkexec bash -c 'systemctl enable nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service'
-# creates 6 symlinks:
-# /etc/systemd/system/systemd-hibernate.service.wants/nvidia-hibernate.service
-# /etc/systemd/system/systemd-suspend.service.wants/nvidia-resume.service + nvidia-suspend.service
-# /etc/systemd/system/systemd-hibernate.service.wants/nvidia-resume.service
-# /etc/systemd/system/systemd-suspend-then-hibernate.service.wants/nvidia-resume.service + nvidia-suspend-then-hibernate.service
-systemctl is-enabled nvidia-hibernate nvidia-resume nvidia-suspend nvidia-suspend-then-hibernate  # -> enabled
-```
+`resume=/dev/mapper/root resume_offset=3735407` (`/proc/cmdline`, `/etc/limine-entry-tool.d/resume.conf`) matches `/sys/power/resume`/`resume_offset`, and the 30.8G `/swap/swapfile` (`swapon --show`, `/etc/fstab`) is correctly sized — swap layout was never the problem. Verified with `omarchy hibernation available` (swap > `/sys/power/image_size`).
 
-**Step 2: Disable `NVreg_PreserveVideoMemoryAllocations` (critical)**
+#### 19.3 Fix applied (2026-09-03) — disable nvidia early KMS
 
-The open kernel module cannot hibernate with video memory preservation enabled because `nv_pmops_freeze` hardcodes `is_procfs_suspend=NV_FALSE`. Disable it:
+The fix keeps the stock parameters (`PreserveVideoMemoryAllocations=1`, `UseKernelSuspendNotifiers=1`, `TemporaryFilePath=/var/tmp`) and removes nvidia from the initramfs so the module loads in real userspace where `/var/tmp` exists and the notifier path works:
 
 ```bash
 pkexec bash -c '
-  sed -i "s/NVreg_PreserveVideoMemoryAllocations=1/NVreg_PreserveVideoMemoryAllocations=0/" /usr/lib/modprobe.d/gsr-nvidia.conf
-  cat /usr/lib/modprobe.d/gsr-nvidia.conf
+  # mkinitcpio only reads *.conf in this dir, so renaming disables it
+  mv /etc/mkinitcpio.conf.d/nvidia.conf /etc/mkinitcpio.conf.d/nvidia.conf.disabled
   limine-mkinitcpio
 '
 ```
 
-> **Tradeoff:** NVIDIA apps (games, CUDA) will lose state on hibernate. Display/compositor is on Intel iGPU, so desktop restores fine. Only `warp-terminal` uses NVIDIA (256MiB) and restarts on resume. Safe for hybrid laptop.
-
-> **Note:** `/usr/lib/modprobe.d/gsr-nvidia.conf` is a package file (`nvidia-utils`); the change may be overwritten on package update. If hibernate breaks again after update, add `/etc/modprobe.d/nvidia.conf` with `options nvidia NVreg_PreserveVideoMemoryAllocations=0` to override.
-
-**Step 3: Revert `UseKernelSuspendNotifiers` back to 1 (optional)**
-
-With `PreserveVideoMemoryAllocations=0`, the kernel suspend notifiers path works correctly and is preferred for modern suspend. Revert the earlier change:
+Also reverted two earlier wrong turns:
 
 ```bash
-pkexec bash -c '
-  sed -i "s/NVreg_UseKernelSuspendNotifiers=0/NVreg_UseKernelSuspendNotifiers=1/" /usr/lib/modprobe.d/nvidia-sleep.conf
-  limine-mkinitcpio
-'
-```
-
-**That's it.** No systemd sleep/logind drop-ins were added. Omarchy 4 defaults are untouched:
-
-- `/etc/systemd/logind.conf.d/10-ignore-power-button.conf` (Omarchy: `HandlePowerKey=ignore` — `Super+Esc` menu)
-- `/etc/systemd/logind.conf.d/20-inhibit-delay.conf` (Omarchy: `InhibitDelayMaxSec=15` — lets `omarchy-system-sleep-lock` lock before suspend)
-- No `/etc/systemd/sleep.conf.d/*.conf` — systemd defaults + `omarchy-hibernation-setup` cmdline (`resume=/dev/mapper/root resume_offset=3735407`, `rtc_cmos.use_acpi_alarm=1`) is enough.
-- Hyprland `switch:on:Lid Switch` -> `omarchy-system-lid-close` still locks + handles clamshell; logind `HandleLidSwitch` still defaults to `suspend`.
-
-`omarchy-hibernation-setup` (`/usr/share/omarchy/bin/omarchy-hibernation-setup`) originally created `/swap/swapfile` (`btrfs filesystem mkswapfile -s MemTotal`), the `/swap` subvolume, the `resume=` + `rtc_cmos` drop-ins, and `/etc/mkinitcpio.conf.d/omarchy_resume.conf` (`HOOKS+=(resume)`). That setup is kept verified:
-
-```bash
-omarchy hibernation available && echo ok  # checks /proc/swaps excluding zram > /sys/power/image_size (13G < 31G)
-cat /proc/cmdline | tr " " "\n" | grep resume
-cat /sys/power/resume; cat /sys/power/resume_offset
-```
-
-No `/usr/share/omarchy/default/systemd/system-sleep/force-igpu` is installed to `/usr/lib/systemd/system-sleep/` (it needs `supergfxctl`, not present; `asusd` handles the G16). The shipped `/usr/lib/systemd/system-sleep/nvidia`, `keyboard-backlight` (prevents ASUS KB LED hang on S4), and `unmount-fuse` (lazy-unmounts `gvfsd-fuse` before freeze) are kept.
-
-#### 19.3 Verify hibernation
-
-```bash
-# 1) nvidia helpers active
-systemctl is-enabled nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service
-
-# 2) after reboot, verify params applied
-cat /proc/driver/nvidia/params | grep -i preserve  # should show 0
-cat /proc/driver/nvidia/params | grep -i notifier  # should show 1 (if reverted)
-
-# 3) dry-run hibernate (saves RAM to /swap/swapfile then powers off — save work first)
-systemctl hibernate
-# after power-on, should resume to desktop instantly; check:
-journalctl -b 0 -k | grep -E "PM: hibernation|nvidia.*PM:"
-# expect: PM: hibernation: resume from hibernation + no resume failed (-5)
-# previous hibernation entry:
-journalctl -b -1 | grep -E "PM: hibernation: hibernation entry|Performing sleep operation"
-
-# 4) revert the fix if needed
+# services are a no-op with the open module (no procfs file) — back to Arch default (disabled)
 pkexec systemctl disable nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service
-pkexec bash -c 'sed -i "s/NVreg_PreserveVideoMemoryAllocations=0/NVreg_PreserveVideoMemoryAllocations=1/" /usr/lib/modprobe.d/gsr-nvidia.conf; limine-mkinitcpio'
+# package-owned modprobe files restored to stock values
+#   /usr/lib/modprobe.d/gsr-nvidia.conf:   NVreg_PreserveVideoMemoryAllocations=1
+#   /usr/lib/modprobe.d/nvidia-sleep.conf: NVreg_UseKernelSuspendNotifiers=1
 ```
 
-Rebuild UKI only if resume params or `mkinitcpio` hooks change: `pkexec limine-mkinitcpio`.
+Tradeoffs:
+
+- The graphical (Plymouth) boot splash may fall back to a text/lower-res mode until nvidia loads after root mount; on this hybrid laptop the panel is driven by the Intel iGPU (`i915`, kept via the `kms` hook), so early boot display still works.
+- If early nvidia KMS is ever needed again (e.g. Wayland session fully on the dGPU), restore with `pkexec mv /etc/mkinitcpio.conf.d/nvidia.conf.disabled /etc/mkinitcpio.conf.d/nvidia.conf && pkexec limine-mkinitcpio` — but hibernation will break again.
+
+Everything else stays at Omarchy defaults: no `sleep.conf.d`/`logind.conf.d` additions (only Omarchy-shipped `10-ignore-power-button.conf`, `20-inhibit-delay.conf`), `resume=` params from `omarchy-hibernation-setup`, and `/usr/lib/systemd/system-sleep/{nvidia,keyboard-backlight,unmount-fuse}` hooks unchanged.
+
+#### 19.4 Verify after reboot
+
+```bash
+# 1) nvidia no longer in initramfs (module loads after root mount)
+lsinitcpio -l /boot/EFI/Linux/omarchy_linux.efi | grep -c "nvidia.ko"   # expect 0 modules
+
+# 2) stock params active
+cat /proc/driver/nvidia/params | grep -E "PreserveVideoMemoryAllocations|UseKernelSuspendNotifiers"
+# PreserveVideoMemoryAllocations: 1  /  UseKernelSuspendNotifiers: 1
+
+# 3) hibernate test (save work first — writes RAM to /swap/swapfile, powers off)
+systemctl hibernate
+# on next boot:
+journalctl -b 0 -k | grep -E "PM: hibernation|nvidia.*PM:"
+# want: "PM: hibernation: resume from hibernation", no "resume failed (-5)"
+journalctl -b -1 | grep -E "hibernation entry"
+
+# 4) full revert
+pkexec bash -c 'mv /etc/mkinitcpio.conf.d/nvidia.conf.disabled /etc/mkinitcpio.conf.d/nvidia.conf; limine-mkinitcpio'
+```
+
+Rebuild UKI after any mkinitcpio/resume change: `pkexec limine-mkinitcpio`.
+
 ### 20. Setup Btrfs Snapshots
 
 Omarchy creates Snapper snapshots for system updates. These are separate from
