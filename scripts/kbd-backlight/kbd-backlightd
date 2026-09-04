@@ -153,21 +153,28 @@ def main() -> None:
     srv.setblocking(False)
     sel.register(srv, selectors.EVENT_READ, "cmd")
 
-    for dev in find_input_devices():
-        try:
-            fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
-        except OSError as e:
-            print(f"kbd-backlightd: cannot open {dev}: {e}", file=sys.stderr)
-            continue
-        sel.register(fd, selectors.EVENT_READ, "input")
-        print(f"kbd-backlightd: watching {dev}", file=sys.stderr)
+    def open_inputs() -> None:
+        """(Re)register input devices; safe to call when keyd restarts and
+        the virtual keyboard lands on a new event node."""
+        for dev in find_input_devices():
+            try:
+                fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                continue
+            sel.register(fd, selectors.EVENT_READ, "input")
+            print(f"kbd-backlightd: watching {dev}", file=sys.stderr)
 
-    def on_input(resumed: bool) -> None:
+    def close_inputs() -> None:
+        for key in list(sel.get_map().values()):
+            if key.data == "input":
+                try:
+                    sel.unregister(key.fileobj)
+                    os.close(key.fileobj)
+                except (OSError, KeyError):
+                    pass
+
+    def on_input() -> None:
         nonlocal last_input, last_wrote
-        if resumed:
-            # Sleep happened; the EC may have touched the LED behind our
-            # back. We are not in control during sleep: invalidate the cache.
-            last_wrote = None
         last_input = time.monotonic()
         if L > 0 and last_wrote != L:
             write_led(L)
@@ -201,12 +208,24 @@ def main() -> None:
     # the LED cache is invalid (the EC is not under our control during sleep).
     wall_mono_delta = time.time() - time.monotonic()
 
+    open_inputs()
+
     while True:
+        # Check sleep once per iteration, before anything else.
+        new_delta = time.time() - time.monotonic()
+        if abs(new_delta - wall_mono_delta) > 1.0:
+            # We slept: the EC may have touched the LED behind our back.
+            wall_mono_delta = new_delta
+            last_wrote = None
+            # keyd may have restarted and moved its virtual keyboard to a new
+            # event node; drop dead fds and re-scan.
+            close_inputs()
+            open_inputs()
+
         lit = last_wrote not in (None, 0)
-        if lit:
-            timeout = max(0.0, IDLE_SECS - (time.monotonic() - last_input))
-        else:
-            timeout = None  # dark: sleep until an event arrives
+        timeout = (max(0.0, IDLE_SECS - (time.monotonic() - last_input))
+                   if lit else None)  # dark: sleep until an event arrives
+
         for key, _ in sel.select(timeout):
             if key.data == "input":
                 try:
@@ -215,14 +234,16 @@ def main() -> None:
                 except BlockingIOError:
                     pass
                 except OSError:
-                    continue  # device vanished; select will keep failing
-                new_delta = time.time() - time.monotonic()
-                resumed = abs(new_delta - wall_mono_delta) > 1.0
-                wall_mono_delta = new_delta
-                on_input(resumed)
+                    # Dead device (e.g. keyd restarted): drop it so select
+                    # stops returning it, then re-scan for the new node.
+                    close_inputs()
+                    open_inputs()
+                    continue
+                on_input()
             else:
                 on_command()
-        if lit and time.monotonic() - last_input >= IDLE_SECS:
+
+        if last_wrote not in (None, 0) and time.monotonic() - last_input >= IDLE_SECS:
             write_led(0)
             last_wrote = 0
 

@@ -702,12 +702,14 @@ LED = L   if L > 0 and (now - last_input) < IDLE_SECS
 LED = 0   otherwise
 ```
 
-Two pieces of state, each with exactly one writer:
+State (all in the daemon's memory; nothing else on the system reads or writes
+any of it):
 
 | State | Meaning | Written by |
 |---|---|---|
 | `L` | the user's chosen level (0-3); 0 = user turned it off | **only** the `up`/`down`/`off` commands |
-| `last_wrote` | the last value this daemon instance wrote to the LED | the daemon itself |
+| `last_input` | timestamp of last keyboard/touchpad activity | only input events |
+| `last_wrote` | the last value this daemon wrote to the LED | the daemon itself |
 
 The daemon never reads the LED register on the hot path — it tracks what it
 last wrote and trusts only that. The EC (which handles the hardware Fn keys
@@ -726,14 +728,16 @@ Event handling:
 
 Key properties:
 
-- **Suspend/resume = cache invalidation, nothing more.** The daemon freezes
-  with the system; on the first input event after a wall-clock/monotonic-clock
-  divergence (i.e. we slept), it sets `last_wrote = None` — "we were not in
-  control during sleep, so assume we wrote nothing" — and the next keystroke
-  writes `L` again. No logind hooks, no D-Bus listeners, no EC special-casing.
-  (Observed failure this fixes: after resume the LED register can read 2 while
-  the physical LEDs are dark — the EC dropped the write. Never trusting the
-  register sidesteps this entirely.)
+- **Suspend/resume = cache invalidation + device re-scan, nothing more.** The
+  daemon freezes with the system; on the first loop iteration after a
+  wall-clock/monotonic-clock divergence (i.e. we slept) it sets
+  `last_wrote = None` — "we were not in control during sleep, so assume we
+  wrote nothing" — and re-opens the input devices, because keyd's virtual
+  keyboard can land on a *new* event node across hibernate/resume, leaving the
+  old fds dead (a dead fd is permanently readable in epoll, so failing to
+  unregister it livelocks the loop — observed 2026-09-04: keyboard stayed dark
+  after hibernate with the daemon running and spinning). No logind hooks, no
+  D-Bus listeners.
 - **Normal typing costs zero sysfs writes** (`last_wrote == L` → skip).
   Relight after idle or sleep costs exactly one write. Commands always write
   (a deliberate press should always apply, even if the level didn't change).
