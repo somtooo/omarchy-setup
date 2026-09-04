@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""kbd-backlightd: Dell-style keyboard backlight for ASUS laptops on Linux.
+
+One process, one thread, one selector event loop. All state lives in memory
+here, so races are impossible by construction: every event (input, command,
+timer) is processed atomically, one at a time.
+
+Invariant:
+
+    LED = L   if L > 0 and (now - last_input) < IDLE_SECS
+    LED = 0   otherwise
+
+L (the user's chosen level) is written ONLY by explicit up/down/off commands
+received on the control socket. Input events never write L. L is persisted
+atomically (os.replace) only when it changes.
+
+The EC's own brightness changes (hardware Fn keys, clearing the LED across
+suspend) are never adopted into L; the next event re-asserts the invariant.
+
+Runs as a system service (root). The OSD is shown by forking omarchy-osd
+with the graphical session's Wayland environment, discovered at runtime.
+"""
+
+import os
+import selectors
+import signal
+import socket
+import struct
+import sys
+import time
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")
+STATE_HOME = "/var/lib/kbd-backlightd"
+
+IDLE_SECS = int(os.environ.get("IDLE_SECS", "30"))
+LED_SYSFS = "/sys/class/leds/asus::kbd_backlight"
+LED_PATH = f"{LED_SYSFS}/brightness"
+MAX_LEVEL = int(open(f"{LED_SYSFS}/max_brightness").read())
+STATE_FILE = os.path.join(STATE_HOME, "level")
+SOCKET_PATH = os.path.join(RUNTIME, "kbd-backlightd.sock")
+
+INPUT_EVENT = struct.Struct("qqHHi")  # sec, usec, type, code, value
+
+
+def read_led() -> int:
+    try:
+        with open(LED_PATH) as f:
+            return int(f.read())
+    except (OSError, ValueError):
+        return 0
+
+
+def write_led(level: int) -> None:
+    try:
+        with open(LED_PATH, "w") as f:
+            f.write(str(level))
+    except OSError as e:
+        print(f"kbd-backlightd: LED write failed: {e}", file=sys.stderr)
+
+
+def load_L() -> int:
+    try:
+        with open(STATE_FILE) as f:
+            return max(0, min(MAX_LEVEL, int(f.read())))
+    except (OSError, ValueError):
+        return read_led()  # first run: adopt current hardware level
+
+
+def save_L(level: int) -> None:
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(str(level))
+    os.replace(tmp, STATE_FILE)
+
+
+def find_input_devices() -> list[str]:
+    kbd = tpad = None
+    for entry in os.listdir("/sys/class/input"):
+        if not entry.startswith("event"):
+            continue
+        try:
+            with open(f"/sys/class/input/{entry}/device/name") as f:
+                name = f.read().strip().lower()
+        except OSError:
+            continue
+        if name == "keyd virtual keyboard":
+            kbd = f"/dev/input/{entry}"
+        elif "touchpad" in name:
+            tpad = f"/dev/input/{entry}"
+    if kbd is None:
+        kbd = "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
+    return [d for d in (kbd, tpad) if d]
+
+
+def _session_env() -> dict:
+    """Find the logged-in user's Wayland session env for the OSD fork."""
+    env = {}
+    try:
+        for uid in os.listdir("/run/user"):
+            rd = f"/run/user/{uid}"
+            if os.path.exists(os.path.join(rd, "wayland-1")):
+                env = {"XDG_RUNTIME_DIR": rd, "WAYLAND_DISPLAY": "wayland-1",
+                       "DBUS_SESSION_BUS_ADDRESS": f"unix:path={rd}/bus"}
+                break
+    except OSError:
+        pass
+    return env
+
+
+def show_osd(level: int) -> None:
+    env = _session_env()
+    if not env:
+        return
+    if os.fork() == 0:
+        try:
+            os.execvpe("omarchy-osd",
+                       ["omarchy-osd", "-i", "keyboard", "-p", str(level * 100 // MAX_LEVEL)],
+                       {**os.environ, **env})
+        except OSError:
+            pass
+        os._exit(0)
+
+
+def main() -> None:
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # reap OSD children
+
+    # Wait for the user's runtime dir (may not exist yet at early boot).
+    for _ in range(120):
+        if os.path.isdir(RUNTIME):
+            break
+        time.sleep(1)
+
+    L = load_L()
+    last_input = time.monotonic()
+    sel = selectors.DefaultSelector()
+
+    try:
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCKET_PATH)
+    # Socket lives in the user's runtime dir (mode 700), so only that user
+    # can reach it; 0666 on the socket itself lets the user-owned client
+    # connect to this root-owned daemon.
+    os.chmod(SOCKET_PATH, 0o666)
+    srv.listen()
+    srv.setblocking(False)
+    sel.register(srv, selectors.EVENT_READ, "cmd")
+
+    for dev in find_input_devices():
+        try:
+            fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as e:
+            print(f"kbd-backlightd: cannot open {dev}: {e}", file=sys.stderr)
+            continue
+        sel.register(fd, selectors.EVENT_READ, "input")
+        print(f"kbd-backlightd: watching {dev}", file=sys.stderr)
+
+    def on_input() -> None:
+        nonlocal last_input
+        last_input = time.monotonic()
+        if L > 0 and read_led() == 0:
+            write_led(L)
+
+    def on_command() -> None:
+        nonlocal L, last_input
+        last_input = time.monotonic()  # the keypress that sent this is input
+        conn, _ = srv.accept()
+        try:
+            msg = conn.recv(16).decode().strip()
+        finally:
+            conn.close()
+        old = L
+        if msg == "up":
+            L = min(MAX_LEVEL, L + 1)
+        elif msg == "down":
+            L = max(0, L - 1)
+        elif msg == "off":
+            L = 0
+        else:
+            return
+        if L != old:
+            save_L(L)
+        write_led(L)
+        show_osd(L)
+
+    while True:
+        lit = read_led() > 0
+        if lit:
+            timeout = max(0.0, IDLE_SECS - (time.monotonic() - last_input))
+        else:
+            timeout = None  # dark: sleep until an event arrives
+        for key, _ in sel.select(timeout):
+            if key.data == "input":
+                try:
+                    while os.read(key.fileobj, INPUT_EVENT.size):
+                        pass
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    continue  # device vanished; select will keep failing
+                on_input()
+            else:
+                on_command()
+        if lit and time.monotonic() - last_input >= IDLE_SECS:
+            write_led(0)
+
+
+if __name__ == "__main__":
+    main()

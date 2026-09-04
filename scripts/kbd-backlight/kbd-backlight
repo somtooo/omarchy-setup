@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""kbd-backlight: client for kbd-backlightd. Usage: kbd-backlight up|down|off
+
+Sends the command over the control socket. The daemon applies it atomically:
+updates L, writes the LED, persists L, shows the OSD.
+"""
+import os
+import socket
+import sys
+
+msg = sys.argv[1] if len(sys.argv) > 1 else ""
+if msg not in ("up", "down", "off"):
+    sys.exit(f"usage: kbd-backlight up|down|off")
+
+path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+                    "kbd-backlightd.sock")
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(path)
+s.sendall(msg.encode())
+s.close()

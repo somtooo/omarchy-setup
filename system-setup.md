@@ -74,6 +74,21 @@ sudo systemctl enable --now keyd
 sudo keyd reload
 ```
 
+### 3b. Map the ASUS Fn keys that emit fake combos
+
+The G16's EC sends some Fn keys as hardcoded Windows key combos rather than
+dedicated keycodes. Fn+F6 (the "screenshot" keycap) arrives as
+**Shift+Alt+S** (the Windows snipping-tool shortcut). Map it to the Omarchy
+screenshot in `~/.config/hypr/bindings.lua` (PRINT stays bound for external
+keyboards):
+
+```lua
+o.bind("SHIFT + ALT + S", "Screenshot", "omarchy-capture-screenshot")
+```
+
+Fn+F2/F3 (keyboard backlight) are different: the EC handles them entirely in
+hardware and sends nothing to Linux — see [19b](#19b-dell-style-keyboard-backlight-idle-off-asus).
+
 ---
 
 ## Restore Configurations
@@ -509,98 +524,122 @@ pkexec bash -c 'mv /etc/mkinitcpio.conf.d/nvidia.conf.disabled /etc/mkinitcpio.c
 
 > **Hardware:** ASUS ROG Zephyrus G16 GU605CR, but works on any ASUS laptop
 > exposing `/sys/class/leds/asus::kbd_backlight`.
-> **Tested 2026-09-04:** backlight lights instantly on keypress or touchpad
-> touch at the user's chosen level, turns off after 30s idle, and survives
-> suspend/resume without losing the chosen level.
+> **Tested 2026-09-04:** instant relight on keypress/touchpad, idle-off after
+> 30s, level survives suspend/resume and reboot, Super+F2/F3 adjust with the
+> Omarchy OSD.
 
-Unlike Dell laptops (whose EC turns the keyboard backlight on while typing and
-fades it out when idle), ASUS exposes only a raw brightness level
+Unlike Dell laptops (whose EC turns the keyboard backlight on while typing
+and fades it out when idle), ASUS exposes only a raw brightness level
 (`asus::kbd_backlight`, levels 0-3) to Linux, and asusctl v6 removed its old
-`awake` LED mode. This section installs a small dependency-free daemon that
-recreates the Dell behavior in userspace.
+`awake` LED mode. This section installs `kbd-backlightd`, a tiny Python
+daemon that recreates the Dell behavior.
 
-Behavior:
+#### Design
 
-- Pressing any key **or touching the touchpad** lights the backlight at the
-  chosen level, with no perceptible delay.
-- After **30 seconds** with no keyboard or touchpad activity, the backlight
-  turns off.
-- Suspend/resume and lid close are handled: the EC clears the backlight, and
-  the daemon relights on the first input afterwards.
+One process, one thread, one selector event loop. All state lives in memory
+inside that loop, so races are impossible by construction — every event
+(input, command, timer) is processed atomically, one at a time. (Earlier
+shell-script versions of this feature kept state in files shared between a
+handful of concurrent processes; every bug they had was the same race in a
+new costume.)
 
-#### The Fn key problem and the one-source-of-truth fix
+The daemon maintains a single invariant:
+
+```
+LED = L   if L > 0 and (now - last_input) < IDLE_SECS
+LED = 0   otherwise
+```
+
+Two pieces of state, each with exactly one writer:
+
+| State | Meaning | Written by |
+|---|---|---|
+| `L` | the user's chosen level (0-3); 0 = user turned it off | **only** the `up`/`down`/`off` commands |
+| `last_input` | timestamp of last keyboard/touchpad activity | only input events |
+
+Event handling:
+
+| Event | Action |
+|---|---|
+| input event | `last_input = now`; if `LED == 0 and L > 0`, write `L` to the LED (instant relight) |
+| `up` / `down` | `L = clamp(L ± 1, 0, 3)`; write LED; persist `L`; show OSD |
+| `off` | `L = 0`; write 0; persist; show OSD |
+| timer | if idle ≥ `IDLE_SECS` and LED > 0, write 0 |
+
+Key properties:
+
+- **Suspend/resume needs no handling.** The EC (not Linux) clears the
+  backlight across sleep. After resume the LED is simply off, which is
+  indistinguishable from idle-off, so the first input event relights to `L`.
+  No logind/D-Bus listeners, no resume hooks.
+- **Hardware changes are never adopted into `L`.** The EC's own Fn-key
+  handling (see below) and any other out-of-band writes only affect the LED
+  until the next event re-asserts the invariant. One writer for intent, ever.
+- **`L` is persisted** (atomic `os.replace`) only when it changes, to
+  `/var/lib/kbd-backlightd/level`. On startup the daemon reads it; if absent
+  it adopts the current hardware level.
+- **Performance:** the hot path is `select()` wake → read one 24-byte
+  `input_event` → compare → one sysfs write. No subprocesses, no disk reads,
+  no polling. Relight latency is single-digit milliseconds; idle CPU is zero
+  (when dark the loop sleeps in `select()` with no timeout).
+
+#### The Fn key problem
 
 On this machine the EC consumes the keyboard-backlight Fn keys (Fn+F2/F3)
 entirely in hardware: they change the LEDs but emit **zero** Linux input
-events (verified: nothing on the AT keyboard, WMI hotkeys, or keyd devices).
-That makes them unusable as an intent signal and means they can never trigger
-an OSD.
+events (verified: nothing on the AT keyboard, WMI hotkeys, or keyd devices),
+so they can never drive an OSD or serve as an intent signal.
 
-Meanwhile the F-row sends real F-keycodes when a modifier is held (physical
-Ctrl+F2/F3, which the keyd macOS map turns into Super+F2/F3). So brightness
-control is bound to **Super+F2/F3** through `omarchy-brightness-keyboard`,
-and a PATH shim at `/usr/local/bin/omarchy-brightness-keyboard` (which
-precedes `/usr/share/omarchy/bin` in Hyprland's environment) records the
-resulting level to `$XDG_RUNTIME_DIR/kbd-backlight-intent` after every press.
+The F-row *does* send real F-keycodes when a modifier is held, so brightness
+control is bound to **Super+F2/F3** (physical Ctrl+F2/F3 under the keyd macOS
+map). The binding calls `kbd-backlight up|down`, a tiny client that sends the
+command to the daemon over its control socket — keeping the daemon the single
+writer of `L` and adding the Omarchy OSD.
 
-That intent file is the **single source of truth** for the user's level `L`.
-The daemon only ever reads it — it never infers intent from the hardware
-state, so EC resets across suspend can never corrupt it. Add to
-`~/.config/hypr/bindings.lua`:
+Add to `~/.config/hypr/bindings.lua`:
 
 ```lua
-o.bind("SUPER + F2", "Keyboard brightness down", "omarchy-brightness-keyboard down", { locked = true })
-o.bind("SUPER + F3", "Keyboard brightness up", "omarchy-brightness-keyboard up", { locked = true })
+o.bind("SUPER + F2", "Keyboard brightness down", "kbd-backlight down", { locked = true })
+o.bind("SUPER + F3", "Keyboard brightness up", "kbd-backlight up", { locked = true })
 ```
 
-#### How the daemon works
-
-Two parts, both trivial:
-
-1. **Watchers** (one per input device) read raw `input_event`s with `dd` — no
-   evtest/libinput dependency. Each event stamps a monotonic-ish clock file
-   (atomic tmp+rename, unique per watcher to avoid races) and, if the
-   backlight is currently **off** and `L > 0`, relights it immediately. The
-   watcher never writes to a lit backlight, so it can never fight a
-   brightness adjustment in progress.
-2. **A 2s tick loop** whose only job is the idle timeout: if the light is on
-   and no input for `IDLE_SECS`, turn it off.
-
-Because **keyd** grabs the physical keyboard, the daemon watches the
-`keyd virtual keyboard` device; the touchpad is read directly (keyd doesn't
-grab pointer devices). brightnessctl is not used (it hangs on D-Bus when run
-as root).
+The EC's Fn+F2/F3 still change the hardware level, but the daemon re-asserts
+`L` on the next input event, so don't use them — Super+F2/F3 is the control.
 
 #### Install
 
-Scripts live in [`scripts/kbd-backlight-idle/`](scripts/kbd-backlight-idle/):
+Scripts live in [`scripts/kbd-backlight/`](scripts/kbd-backlight/):
 
 ```bash
-sudo install -Dm755 scripts/kbd-backlight-idle/kbd-idle-daemon /usr/local/bin/kbd-idle-daemon
-sudo install -Dm755 scripts/kbd-backlight-idle/omarchy-brightness-keyboard /usr/local/bin/omarchy-brightness-keyboard
-sudo install -Dm644 scripts/kbd-backlight-idle/kbd-idle-daemon.service /etc/systemd/system/kbd-idle-daemon.service
+sudo install -Dm755 scripts/kbd-backlight/kbd-backlightd /usr/local/bin/kbd-backlightd
+sudo install -Dm755 scripts/kbd-backlight/kbd-backlight /usr/local/bin/kbd-backlight
+sudo install -Dm644 scripts/kbd-backlight/kbd-backlightd.service /etc/systemd/system/kbd-backlightd.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now kbd-idle-daemon.service
+sudo systemctl enable --now kbd-backlightd.service
 ```
+
+No Python dependencies — stdlib only.
 
 #### Verify
 
 ```bash
-systemctl status kbd-idle-daemon.service
-journalctl -u kbd-idle-daemon -f   # should show the watched keyboard + touchpad devices
+systemctl status kbd-backlightd.service
+journalctl -u kbd-backlightd -f        # shows the watched input devices
 
-# Hands off keyboard and touchpad for ~35s:
-watch -n1 cat /sys/class/leds/asus::kbd_backlight/brightness   # drops to 0
-# Type a key or touch the touchpad: returns to previous level instantly
-# Super+F2/F3: changes level with OSD; cat $XDG_RUNTIME_DIR/kbd-backlight-intent
+kbd-backlight up                       # LED +1, OSD appears
+kbd-backlight down                     # LED -1
+cat /var/lib/kbd-backlightd/level      # matches the LED level
+
+# Hands off keyboard and touchpad for ~35s: LED turns off.
+# Type a key or touch the touchpad: instantly back at L.
 ```
 
 #### Configure
 
-Change the idle timeout (default 30s) with a drop-in:
+Change the idle timeout (default 30s):
 
 ```bash
-sudo systemctl edit kbd-idle-daemon
+sudo systemctl edit kbd-backlightd
 ```
 
 ```ini
@@ -608,14 +647,15 @@ sudo systemctl edit kbd-idle-daemon
 Environment=IDLE_SECS=15
 ```
 
-Then `sudo systemctl restart kbd-idle-daemon`.
+Then `sudo systemctl restart kbd-backlightd`.
 
 #### Uninstall
 
 ```bash
-sudo systemctl disable --now kbd-idle-daemon.service
-sudo rm /usr/local/bin/kbd-idle-daemon /usr/local/bin/omarchy-brightness-keyboard \
-        /etc/systemd/system/kbd-idle-daemon.service
+sudo systemctl disable --now kbd-backlightd.service
+sudo rm /usr/local/bin/kbd-backlightd /usr/local/bin/kbd-backlight \
+        /etc/systemd/system/kbd-backlightd.service
+sudo rm -rf /var/lib/kbd-backlightd
 sudo systemctl daemon-reload
 # and remove the SUPER+F2/F3 binds from ~/.config/hypr/bindings.lua
 ```
