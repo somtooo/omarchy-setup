@@ -529,20 +529,33 @@ Behavior:
   `omarchy-brightness-keyboard` binding); pressing Fn+F3 down to 0 turns the
   light off and it stays off until Fn+F4 is pressed.
 
-How it works: the daemon reads raw `input_event`s from the keyboard and
-touchpad devices with `dd` (no evtest/libinput dependency). Because **keyd**
-grabs the physical keyboard, the daemon watches the `keyd virtual keyboard`
-device instead; the touchpad is not grabbed by keyd and is read directly.
-The level is persisted in `/run/kbd-idle-level` (brightnessctl cannot be used
-here — it hangs on D-Bus when run as root).
+How it works: the daemon is a tiny control loop, not a state machine. The
+only persistent state is `L`, the user's chosen level (0-3) in
+`/run/kbd-idle-level`. Every 2 seconds (and implicitly on every input event)
+it evaluates one control law:
 
-Suspend/resume edge case: the ASUS EC **clears the backlight across deep
-sleep**. The kernel reports EC-originated brightness changes through the
-LED's `brightness_hw_changed` uevent, so the daemon also runs
-`udevadm monitor --subsystem-match=leds`; when the hardware goes dark while
-the saved level is > 0 (i.e. the user never asked for off), it relights.
-Fn+F3/F4 still work because Omarchy handles them via software writes, which
-do not emit that uevent, so the two paths never fight.
+```
+b = L   if L > 0 and (now - last_input) < IDLE_SECS
+b = 0   otherwise
+```
+
+External changes are adopted rather than tracked: a nonzero hardware level
+different from `L` becomes the new `L` (Fn keys, brightnessctl, whatever),
+and a zero level while the user is active means the user turned it off, so
+`L` becomes 0. The loop is idempotent and converges from any disturbance,
+so no per-cause handling is needed.
+
+Suspend/resume falls out of the same math: across deep sleep the wall clock
+jumps and the ASUS EC clears the backlight. The daemon notices the jump
+(elapsed time between ticks ≫ poll interval), classifies the darkness as
+system-caused rather than a manual off, keeps `L`, and relights on the first
+keystroke or touchpad touch.
+
+Input events are read as raw `input_event`s with `dd` (no evtest/libinput
+dependency). Because **keyd** grabs the physical keyboard, the daemon watches
+the `keyd virtual keyboard` device instead; the touchpad is not grabbed by
+keyd and is read directly. brightnessctl is not used (it hangs on D-Bus when
+run as root).
 
 #### Install
 
