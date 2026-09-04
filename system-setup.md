@@ -492,7 +492,7 @@ The internal panel is driven by the Intel iGPU (`i915`, still in the initramfs v
 pkexec chmod +x /usr/lib/systemd/system-sleep/keyboard-backlight
 ```
 
-No systemd `sleep.conf.d`/`logind.conf.d` additions; lid/idle behavior stays at Omarchy defaults. The `resume=`/`resume_offset=` kernel parameters and `/swap/swapfile` from `omarchy-hibernation-setup` are used unchanged.
+Lid/idle behavior stays at Omarchy defaults. The `resume=`/`resume_offset=` kernel parameters and `/swap/swapfile` from `omarchy-hibernation-setup` are used unchanged.
 
 #### 19.4 Verify (after reboot)
 
@@ -521,6 +521,52 @@ pkexec systemctl disable nvidia-hibernate.service nvidia-resume.service nvidia-s
 pkexec rm /etc/modprobe.d/nvidia-sleep.conf
 pkexec bash -c 'mv /etc/mkinitcpio.conf.d/nvidia.conf.disabled /etc/mkinitcpio.conf.d/nvidia.conf; limine-mkinitcpio'
 ```
+
+#### 19.6 Suspend regression: `mem_sleep_default=deep` freezes on resume (do not use)
+
+> **Regression 2026-09-04, fixed same day.** Plain `systemctl suspend` / lid-close
+> suspended but **froze on resume** (backlight flicker, then a hang requiring a
+> hard power-off). Hibernate (§19.1–19.5) was unaffected — this is a separate
+> change that broke S3, not the hibernate fix.
+
+**Symptom.** Suspend enters (`PM: suspend entry (deep)`) but the journal never
+logs `suspend exit`; the next boot is a clean power-on (`PM: Image not found`,
+since no hibernate image was written). Journal evidence: `deep` was entered
+twice and resumed **0/2** times, while `s2idle` resumed **36/36**.
+
+**Root cause.** A prior session appended `mem_sleep_default=deep` to
+`/etc/default/limine` to reduce battery drain (s2idle drains the battery within
+a day). That flips suspend from **s2idle** to **S3/"deep"**. This machine (Intel
+Core Ultra 9 285H, a modern-standby / S0ix platform) advertises `S3` in ACPI but
+cannot actually resume from it — the S3 resume path hangs. Because the kernel
+cmdline is baked into the UKI, the change only took effect after the next reboot,
+which is why suspend "suddenly" broke in the morning.
+
+**Fix — keep s2idle (revert the `deep` override).** Remove the line and rebuild
+the UKI:
+
+```bash
+pkexec sed -i '/mem_sleep_default=deep/d' /etc/default/limine
+pkexec limine-mkinitcpio   # regenerates /boot/limine.conf + the UKI
+```
+
+Verify after reboot: `cat /sys/power/mem_sleep` → `s2idle [deep]` becomes
+`[s2idle] deep` (s2idle selected). Do **not** re-add `mem_sleep_default=deep` —
+it is unrecoverable on this hardware.
+
+**Battery drain is handled without deep sleep.** With s2idle restored, logind
+already prefers **suspend-then-hibernate** (`SleepOperation` defaults to
+`suspend-then-hibernate suspend`, and `CanSuspendThenHibernate` reports `yes`
+here). So a lid close suspends in
+s2idle for a quick wake, then automatically hibernates after
+`HibernateDelaySec` (compiled default **2h**) — zero battery drain on long
+sleeps, reliable resume on short ones. No `sleep.conf.d` override is needed;
+the defaults are correct. (To shorten the 2h delay, an optional drop-in is
+`Sleep.HibernateDelaySec=` in `/etc/systemd/sleep.conf.d/` — not required.)
+
+**Key distinction:** hibernate uses **S4**, suspend-then-hibernate's suspend
+phase uses the default sleep state (now s2idle again). The broken `deep` path
+only ever affected the suspend phase.
 
 ### 19b. Dell-style Keyboard Backlight Idle-Off (ASUS)
 
