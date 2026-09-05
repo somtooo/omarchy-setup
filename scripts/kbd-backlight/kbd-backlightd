@@ -34,6 +34,7 @@ RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")
 STATE_HOME = "/var/lib/kbd-backlightd"
 
 IDLE_SECS = int(os.environ.get("IDLE_SECS", "30"))
+RECOVER_SECS = int(os.environ.get("RECOVER_SECS", "10"))
 LED_SYSFS = "/sys/class/leds/asus::kbd_backlight"
 LED_PATH = f"{LED_SYSFS}/brightness"
 MAX_LEVEL = int(open(f"{LED_SYSFS}/max_brightness").read())
@@ -109,7 +110,11 @@ def main() -> None:
 
     L = load_L()
     last_input = time.monotonic()
-    log(f"start: L={L} register={read_led()}")
+    # Believe what the register shows at startup (e.g. systemd-backlight
+    # restored a level at boot) so the idle timer applies to it.
+    last_wrote = read_led()
+    recover_until = 0.0  # monotonic deadline; > now means recovery mode
+    log(f"start: L={L} register={last_wrote}")
 
     sel = selectors.DefaultSelector()
 
@@ -146,16 +151,26 @@ def main() -> None:
                     pass
 
     def on_input() -> None:
-        nonlocal last_input
+        nonlocal last_input, last_wrote
         last_input = time.monotonic()
-        if L > 0:
+        if L == 0:
+            return
+        if time.monotonic() < recover_until:
+            # Recovery mode (post-sleep): don't trust anything. Read the
+            # register; if it doesn't match L, someone else (EC, asusd) owns
+            # it — write L. Stay out of control until the window expires.
             b = read_led()
             if b != L:
                 write_led(L)
-                log(f"relight: register was {b}, wrote {L}")
+                log(f"recovery: register was {b}, wrote {L}")
+            # last_wrote stays None until recovery ends
+        elif last_wrote != L:
+            write_led(L)
+            last_wrote = L
+            log(f"relight: wrote {L}")
 
     def on_command() -> None:
-        nonlocal L, last_input
+        nonlocal L, last_input, last_wrote
         last_input = time.monotonic()  # the keypress that sent this is input
         conn, _ = srv.accept()
         try:
@@ -173,6 +188,12 @@ def main() -> None:
             if L != old:
                 save_L(L)
             write_led(L)  # unconditional: a deliberate press should always apply
+            if time.monotonic() < recover_until:
+                # Recovery mode: stay out of control; the next input event
+                # will read the register and re-assert if needed.
+                last_wrote = None
+            else:
+                last_wrote = L
             log(f"command {msg}: L {old} -> {L}")
             # Reply with the level: the client (running in the user session)
             # shows the OSD — root can't reach the Wayland socket.
@@ -180,12 +201,30 @@ def main() -> None:
         finally:
             conn.close()
 
+    # Resume detection: time.monotonic() freezes during deep sleep while wall
+    # clock (time.time()) keeps running. A jump in their delta = we slept.
+    # Real suspends shift the delta by minutes; small shifts (NTP slew,
+    # scheduler stalls) must not trigger this.
+    wall_mono_delta = time.time() - time.monotonic()
+
     open_inputs()
 
     while True:
-        lit = read_led() > 0
+        new_delta = time.time() - time.monotonic()
+        if abs(new_delta - wall_mono_delta) > 5.0:
+            # We slept. The EC is mid-reset for a while after resume and may
+            # drop or undo writes — enter bounded recovery mode: input events
+            # verify their writes against the register until the deadline.
+            log(f"resume detected (clock delta jumped {new_delta - wall_mono_delta:+.1f}s); "
+                f"recovering for {RECOVER_SECS}s")
+            wall_mono_delta = new_delta
+            last_wrote = None
+            last_input = time.monotonic()  # pre-sleep idle time doesn't count
+            recover_until = time.monotonic() + RECOVER_SECS
+
+        lit = isinstance(last_wrote, int) and last_wrote > 0
         timeout = (max(0.0, IDLE_SECS - (time.monotonic() - last_input))
-                   if lit else 1.0)
+                   if lit else None)  # dark: sleep until an event arrives
 
         for key, _ in sel.select(timeout):
             if key.data == "input":
@@ -206,12 +245,9 @@ def main() -> None:
                 on_command()
 
         if lit and time.monotonic() - last_input >= IDLE_SECS:
-            # lit was computed from the register at the top of this iteration;
-            # a duplicate write means the register read lagged the last write
-            # (EC round-trip), so re-read to suppress the duplicate.
-            if read_led() > 0:
-                log(f"idle {IDLE_SECS}s: wrote 0 (L stays {L})")
-                write_led(0)
+            log(f"idle {IDLE_SECS}s: wrote 0 (L stays {L})")
+            write_led(0)
+            last_wrote = 0
 
 
 if __name__ == "__main__":
