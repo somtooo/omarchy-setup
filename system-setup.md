@@ -436,14 +436,20 @@ separate legacy suspend or hypridle service.
 
 Apply all of the following.
 
-**1. NVIDIA hibernate support.** Three things make the NVIDIA driver handle the
-sleep cycle correctly:
+**1. NVIDIA hibernate support.** Shadow the packaged `nvidia-sleep.conf` (same
+filename in `/etc/modprobe.d/` replaces the packaged one) with two options:
+
+- `NVreg_UseKernelSuspendNotifiers=0` — makes the driver's `/proc/driver/nvidia/suspend`
+  interface exist (the packaged `=1` suppresses it and breaks suspend/hibernate).
+- `NVreg_EnableS0ixPowerManagement=1` — lets the dGPU enter its deep low-power
+  state during S4 **even while an app is holding it** (e.g. a terminal renderer
+  like Warp keeps the GPU active). Without this, hibernate writes the image but
+  the platform S4 power-off bounces and the laptop stays on. This makes
+  power-off deterministic regardless of GPU activity.
 
 ```bash
-# Shadow the packaged nvidia-sleep.conf so the driver's procfs suspend
-# interface exists (same filename in /etc/modprobe.d/ replaces the packaged one).
 pkexec bash -c 'cat > /etc/modprobe.d/nvidia-sleep.conf << "EOF"
-options nvidia NVreg_UseKernelSuspendNotifiers=0
+options nvidia NVreg_UseKernelSuspendNotifiers=0 NVreg_EnableS0ixPowerManagement=1
 EOF'
 
 # Enable the NVIDIA sleep services (drive the procfs interface around sleep).
@@ -463,10 +469,9 @@ Re-apply after Omarchy updates until fixed upstream:
 pkexec chmod +x /usr/lib/systemd/system-sleep/keyboard-backlight
 ```
 
-**3. Power off via shutdown, not ACPI S4.** The default `HibernateMode=platform`
-asks the firmware to enter S4; on this board the dGPU won't power down, so the
-machine writes the image but never turns off. `shutdown` writes the same image
-then powers off via the normal kernel path:
+**3. Power off via shutdown, not ACPI S4.** Belt-and-suspenders alongside step 1:
+`HibernateMode=shutdown` writes the same image, then powers off via the normal
+kernel path instead of asking the firmware for S4:
 
 ```bash
 pkexec bash -c 'mkdir -p /etc/systemd/sleep.conf.d && cat > /etc/systemd/sleep.conf.d/hibernate-mode.conf << "EOF"
