@@ -620,6 +620,37 @@ sudo systemctl daemon-reload
 # and remove the SUPER+F2/F3 binds from ~/.config/hypr/bindings.lua
 ```
 
+#### If the backlight dies completely (MCU wedge)
+
+Symptom: the keyboard backlight is fully dark, the sysfs register
+(`/sys/class/leds/asus::kbd_backlight/brightness`) accepts writes and reads
+back the value you wrote, but the physical LEDs never light — and even the
+hardware Fn+F2/F3 keys (which bypass Linux entirely) do nothing. A plain
+reboot does not fix it, because the keyboard MCU (an ITE 8910 USB device)
+stays powered through warm reboots. This has been observed after suspend
+cycles on this machine.
+
+Fix — USB-reset the keyboard MCU to force it to re-enumerate:
+
+```bash
+# Find the device node (usually 3-6):
+for d in /sys/bus/usb/devices/*; do
+  [ "$(cat $d/product 2>/dev/null)" = "ITE Device(8910)" ] && basename $d
+done
+
+# Reset it (replace 3-6 with the node found above):
+echo "3-6" | sudo tee /sys/bus/usb/drivers/usb/unbind
+sleep 2
+echo "3-6" | sudo tee /sys/bus/usb/drivers/usb/bind
+
+# Backlight should respond again:
+echo 3 | sudo tee /sys/class/leds/asus::kbd_backlight/brightness
+```
+
+If the USB reset does not bring it back: full shutdown (not reboot), wait
+10s, power on. Last resort: shutdown, unplug the charger, hold the power
+button 30s to drain residual power and cold-boot the EC.
+
 ### 20. Setup Btrfs Snapshots
 
 Omarchy creates Snapper snapshots for system updates. These are separate from
