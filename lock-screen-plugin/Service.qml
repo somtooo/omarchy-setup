@@ -543,6 +543,15 @@ Item {
       return "ok"
     }
 
+    // Called by sync-login-bg.sh after it rewrites lock-blur.jpg: bumps the
+    // cache-busting query on the background Image so the lock screen drops
+    // the old decoded pixmap and loads the new file.
+    function reloadBackground(): string {
+      root.backgroundVersion += 1
+      console.log("som2.lock: background reloaded (version " + root.backgroundVersion + ")")
+      return "ok"
+    }
+
     function hidePreview(): string {
       root.previewVisible = false
       return "ok"

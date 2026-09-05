@@ -114,7 +114,10 @@ The clone shows `lock-blur.jpg` (blur baked in offline by ImageMagick) with
 no runtime blur, loads it synchronously with `cache: true`, and `Service.qml`
 sets `loadBackground: true` so the image is decoded at shell start. On
 resume-from-suspend the background, avatar, clock and password field all
-appear together with no grey flash.
+appear together with no grey flash. After regenerating the file,
+`sync-login-bg.sh` notifies the shell over IPC (`omarchy-shell -q lock
+reloadBackground`) so the lock screen drops its cached pixmap and loads the
+new background without a shell restart.
 
 ---
 

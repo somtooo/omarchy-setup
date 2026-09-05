@@ -30,6 +30,13 @@ mkdir -p "$CACHE" "$USER_DIR" "$OUT_DIR/sddm-macos"
 exec 9>"$LOCK"
 flock 9
 
+# Tell the running shell to drop its cached lock background and load the new
+# file. Must run after publishing (never before). Harmless if the shell or
+# the lock plugin isn't running.
+notify_shell() {
+  omarchy-shell -q lock reloadBackground >/dev/null 2>&1 || true
+}
+
 render_login_backgrounds() {
   local bg=$1 tmp
   tmp="$(mktemp -d "$CACHE/login-bg-sync.XXXXXX")"
@@ -57,12 +64,14 @@ render_login_backgrounds() {
   echo "  $SDDM_BG (login screen)"
 }
 
+rendered=0
 while true; do
   bg="$(readlink -f "$STATE/background")"
   [[ -f $bg ]] || { echo "No current background found: $bg" >&2; exit 1; }
   key="$bg $(stat -c '%s %Y' "$bg" 2>/dev/null || echo missing) $(cat "$STATE/theme.name" 2>/dev/null || echo unknown)"
 
   if [[ $(cat "$STAMP" 2>/dev/null || true) == "$key" ]]; then
+    if ((rendered)); then notify_shell; fi
     echo "Login backgrounds already match the current wallpaper — nothing to do."
     exit 0
   fi
@@ -70,4 +79,5 @@ while true; do
   echo "Syncing login backgrounds from: $bg"
   render_login_backgrounds "$bg"
   printf '%s\n' "$key" > "$STAMP"
+  rendered=1
 done

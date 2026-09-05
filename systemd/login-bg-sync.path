@@ -2,10 +2,13 @@
 Description=Regenerate blurred login/lock backgrounds when the Omarchy wallpaper changes
 
 [Path]
-# `omarchy theme bg set` re-points the current/background symlink; a theme
-# switch swaps current/theme and rewrites theme.name. Watch both so any
-# wallpaper change regenerates the blurred backgrounds.
-PathChanged=%h/.local/state/omarchy/current/background
+# `omarchy theme bg set` (and bg-next, the background switcher) re-point the
+# current/background symlink with ln -nsf, which modifies the current/
+# directory — not the symlink target. So watch the directory itself: watching
+# the symlink would follow it to the old wallpaper and miss the re-point.
+# theme.name is rewritten in place on theme switches (no directory change),
+# so it still needs its own file watch.
+PathChanged=%h/.local/state/omarchy/current
 PathChanged=%h/.local/state/omarchy/current/theme.name
 Unit=login-bg-sync.service
 
