@@ -40,20 +40,20 @@ pkexec bash -c '
   cp sddm-macos-theme/* /usr/share/sddm/themes/macos/
   chmod 755 /usr/share/sddm/themes/macos
   chmod 644 /usr/share/sddm/themes/macos/*
+  chown "$USER:$USER" /usr/share/sddm/themes/macos/background.jpg
 '
 ```
 
 > Note: run the `pkexec` from inside the repo directory, or adjust the paths.
 > `pkexec` pops up a GUI password prompt, so it works from agents/scripts too.
+> The `chown` is one-time: it lets the user-level sync script overwrite the
+> login background without a password from then on.
 
-Generate the blurred background from your current wallpaper (needs ImageMagick)
-and copy it into the theme:
+Generate the blurred backgrounds from your current wallpaper (needs
+ImageMagick):
 
 ```bash
-magick "$(readlink -f ~/.local/state/omarchy/current/background)" \
-  -resize 2560x2560^ -gravity center -extent 2560x2560 \
-  -blur 0x14 -modulate 90 -quality 90 /tmp/sddm-background.jpg
-pkexec cp /tmp/sddm-background.jpg /usr/share/sddm/themes/macos/background.jpg
+bash scripts/sync-login-bg.sh
 ```
 
 Point SDDM at the new theme:
@@ -121,18 +121,22 @@ appear together with no grey flash.
 ## 3. Changing the background on both screens
 
 ```bash
-omarchy theme bg set /path/to/image.jpg        # set desktop wallpaper
-bash omarchy-setup/scripts/sync-login-bg.sh    # regenerate blurred versions
-pkexec cp ~/devcave/login-customization/sddm-macos/background.jpg /usr/share/sddm/themes/macos/
+omarchy theme bg set /path/to/image.jpg
 ```
 
-(`sync-login-bg.sh` writes to `~/devcave/login-customization/` by default —
-edit the `OUT_DIR` variable at the top if you keep this repo elsewhere.)
+That's it — the path unit below re-runs `sync-login-bg.sh` automatically and
+both screens update with no further commands and no password prompt.
 
-The lock screen now uses the pre-blurred `lock-blur.jpg` from the script, so
-**both** screens need `sync-login-bg.sh` after a wallpaper change (the lock no
-longer follows wallpaper changes automatically). A systemd path unit does this
-for you — see below.
+To regenerate manually (or after editing the script):
+
+```bash
+bash omarchy-setup/scripts/sync-login-bg.sh
+```
+
+(`sync-login-bg.sh` stages the SDDM image under `~/devcave/login-customization/`
+by default — edit the `OUT_DIR` variable at the top if you keep this repo
+elsewhere — then copies it into `/usr/share/sddm/themes/macos/`, which works
+passwordless because that file is user-owned per section 1.)
 
 ### Auto-regenerate on wallpaper change
 
@@ -148,9 +152,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now login-bg-sync.path
 ```
 
-The lock screen background updates automatically from then on. The SDDM
-greeter background is also regenerated but still needs a one-time
-`pkexec cp` into `/usr/share/sddm/themes/macos/` to go live (root-owned dir).
+Both the lock screen and the SDDM login background update automatically from
+then on.
 
 To change the avatar, replace `~/.local/share/login-look/avatar.png` (lock) and
 `/usr/share/sddm/themes/macos/avatar.png` (login). Generate a circular one from

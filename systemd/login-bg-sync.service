@@ -7,6 +7,6 @@ Type=oneshot
 # settling; wait for a quiet moment before doing the (CPU-heavy) blur.
 ExecStartPre=/bin/sleep 2
 ExecStart=%h/devcave/omarchy-setup/scripts/sync-login-bg.sh
-# The script also rewrites the SDDM background in ~/devcave/login-customization;
-# copying it into /usr/share/sddm/themes/macos/ still needs pkexec, so the
-# greeter background updates on next manual copy. Lock screen is live.
+# The script updates the lock background and copies the SDDM background into
+# /usr/share/sddm/themes/macos/ (user-owned per login-and-lock-screens.md
+# section 1, so no password needed). Both screens go live automatically.
