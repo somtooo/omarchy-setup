@@ -213,10 +213,15 @@ pkexec bash -c 'plymouth-set-default-theme omarchy && limine-mkinitcpio'
 To regenerate the orb from a new wallpaper:
 
 ```bash
-magick "$(readlink -f ~/.local/state/omarchy/current/background)" -resize 560x560^ -gravity center -extent 560x560 /tmp/orb-base.png
-magick /tmp/orb-base.png \( -size 560x560 xc:none -fill white -draw 'circle 280,280 280,20' \) -alpha off -compose CopyOpacity -composite /tmp/orb.png
+# 720px orb (Plymouth scales it to 340px); adjust the crop offsets to centre the subject.
+# Negative offsets shift the crop window left/up from centre; check the result visually.
+magick "$(readlink -f ~/.local/state/omarchy/current/background)" -filter Lanczos -resize 720x720^ -gravity center -crop 720x720-320-40 +repage \
+  \( -size 720x720 xc:none -fill white -draw 'circle 360,360 360,40' \) -compose CopyOpacity -composite /tmp/orb.png
 pkexec bash -c 'cp /tmp/orb.png /usr/share/plymouth/themes/beautiful/orb.png && limine-mkinitcpio'
 ```
+
+Note: ImageMagick trims fully-transparent edges, so the saved file may be slightly smaller
+than 720×720 — harmless. The current orb (from `1-quattro.jpg`) uses `-320-40` to centre the car.
 
 To disable autologin and see the SDDM login on every boot (you will then type
 two passwords: disk + user):
