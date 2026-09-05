@@ -16,20 +16,10 @@ Built as a user plugin clone of the stock `omarchy.bar`, so nothing in
 
 `/usr/share/omarchy/shell/plugins/bar/Bar.qml` is Omarchy-owned and gets
 overwritten on update. The clone lives at
-`~/.config/omarchy/plugins/som2.bar/` and survives updates.
-
-The clone also works around two upstream bugs in the plugin-loader
-(omacom/omarchy#9599, #6971):
-
-- `shell.qml`'s `pluginBarLoader` loads bar plugins with an async `Loader`
-  and injects `omarchyPath`, `barWidgetRegistry`, `barConfig` in `onLoaded` —
-  but `Bar.qml` declares those as `required property`, so construction fails
-  before injection. **Fix in the clone: the `required` keyword is removed
-  from those three properties.**
-- The loader's error handler references an undefined `errorString`, so the
-  fallback bar never fires and the plugin id lands in the `failedBarId`
-  blacklist until the shell restarts. Nothing we can do from user config;
-  just be aware that a broken clone needs `omarchy restart shell` to retry.
+`~/.config/omarchy/plugins/som2.bar/` and survives updates. It also removes
+the `required` keyword from three properties (`omarchyPath`,
+`barWidgetRegistry`, `barConfig`) that the stock `Bar.qml` declares —
+Omarchy's plugin loader can't load bar clones that declare them.
 
 ## What the pill styling changes
 
@@ -111,10 +101,12 @@ In `Bar.qml`, inside `component BarPanel`:
 | Glass (transparent mode) | pill `color` first branch | alpha `0.45` |
 | Shadow | `MultiEffect` in `layer.effect` | blur 1.0, y 6 |
 
-> **Hot-reload warning:** the shell's plugin file-watch has proven
-> unreliable for this clone (edits apply silently but the running bar
-> doesn't change). After editing `Bar.qml`, always `omarchy restart shell`
-> and check the journal for `WARN scene ... som2.bar` errors.
+After editing `Bar.qml`, reload the bar and check for errors:
+
+```bash
+omarchy restart shell
+journalctl --user -b | grep som2.bar
+```
 
 ## Revert
 

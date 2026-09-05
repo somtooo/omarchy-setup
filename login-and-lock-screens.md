@@ -18,16 +18,14 @@ Everything here is reversible. Nothing in `/usr/share/omarchy/` is modified.
 | | Boot splash | Login screen | Lock screen |
 |---|---|---|---|
 | Program | Plymouth | SDDM | Omarchy shell (Quickshell) |
-| Theme location | `/usr/share/plymouth/themes/macos/` | `/usr/share/sddm/themes/macos/` | `~/.config/omarchy/plugins/som2.lock/` |
+| Theme location | `/usr/share/plymouth/themes/beautiful/` | `/usr/share/sddm/themes/macos/` | `~/.config/omarchy/plugins/som2.lock/` |
 | Switch config | `plymouth-set-default-theme beautiful` + `limine-mkinitcpio` | `/etc/sddm.conf.d/10-theme.conf` → `Current=macos` | `omarchy plugin enable som2.lock` |
 | Needs root? | Yes | Yes | No |
 | When you see it | Fresh boot (before SDDM) | Logout / boot if autologin disabled | Lock |
 
-> **Why you see "Omarchy" on fresh boot even after changing SDDM:** with
-> autologin enabled (`/etc/sddm.conf.d/autologin.conf` has `User=som2`),
-> SDDM is skipped on boot — you go straight from Plymouth → desktop.
-> So the logo you see on boot is Plymouth, not SDDM. Fix Plymouth (section 4)
-> to remove it. To see SDDM on every boot, disable autologin (see section 4).
+> With autologin enabled (`/etc/sddm.conf.d/autologin.conf`), SDDM is skipped
+> on boot — the logo you see is Plymouth (section 4), not SDDM. To see SDDM
+> on every boot, disable autologin (section 4).
 
 ---
 
@@ -74,9 +72,8 @@ Then log out (Super+Esc → Log Out) to see it live. No reboot needed.
 
 **Revert:** `pkexec sed -i 's/^Current=.*/Current=omarchy/' /etc/sddm.conf.d/10-theme.conf`
 
-> Hyprland shows a blue fallback greeter if the configured theme is missing or
-> broken — that's the safety net, not a broken system. Fix the theme or switch
-> `Current=` back and log out again.
+> If the theme is missing or broken, SDDM shows a blue fallback greeter.
+> Fix the theme or switch `Current=` back and log out again.
 
 ---
 
@@ -111,27 +108,13 @@ and retry. Lock the screen (Super+Esc → Lock) to see it.
 
 **Revert:** `omarchy plugin enable omarchy.lock` (the clone can stay in place).
 
-### Why the lock background is pre-blurred (resume-from-suspend speed)
+### Lock background: pre-blurred for instant resume
 
-The stock plugin (and an earlier version of this clone) loaded the raw
-wallpaper and applied a live GPU blur (`MultiEffect`, blurMax 128) **at lock
-time** (`loadBackground: root.locked`). On resume-from-suspend that meant:
-decode a 4K JPEG + build a big GPU blur graph on a just-woken GPU before the
-first lock frame could commit — Hyprland shows its grey session-lock failsafe
-for ~3-4 seconds in the meantime.
-
-The clone now:
-
-- shows `lock-blur.jpg` (blur baked in offline by ImageMagick) with **no
-  runtime blur** — a plain decoded JPEG paints far sooner
-- loads it **synchronously with `cache: true`**, and `Service.qml` sets
-  `loadBackground: true` so the image is decoded when the shell starts, not
-  when you lock
-- adds a cheap translucent black overlay (`Qt.rgba(0,0,0,0.18)`) for
-  legibility instead of the blur's brightness/contrast tweaks
-
-Result: background, avatar, clock and password field all appear together on
-wake with no grey flash.
+The clone shows `lock-blur.jpg` (blur baked in offline by ImageMagick) with
+no runtime blur, loads it synchronously with `cache: true`, and `Service.qml`
+sets `loadBackground: true` so the image is decoded at shell start. On
+resume-from-suspend the background, avatar, clock and password field all
+appear together with no grey flash.
 
 ---
 
@@ -186,13 +169,11 @@ magick input.png -resize 256x256 \
 Omarchy shows a boot splash **before** SDDM. With autologin enabled (the default
 at `/etc/sddm.conf.d/autologin.conf`), SDDM is skipped on fresh boot — the
 password prompt you see is **Plymouth asking for the disk-encryption password**
-(the disk is encrypted, so this prompt always appears). That is why the stock
-"Omarchy" logo showed even after the SDDM theme was changed.
+(the disk is encrypted, so this prompt always appears on every boot).
 
-`plymouth-beautiful-theme/` replaces it: stock Omarchy splash script (proven
-code) with the logo swapped for a glowing orb cropped from your wallpaper,
-a frosted-glass pill password field, and a soft white progress bar. All PNGs —
-Plymouth **cannot load JPGs**, which is what broke an earlier attempt.
+`plymouth-beautiful-theme/` replaces the stock splash: the logo swapped for a
+glowing orb cropped from your wallpaper, a frosted-glass pill password field,
+and a soft white progress bar. All assets are PNGs — Plymouth cannot load JPGs.
 
 ```bash
 # Install theme files
