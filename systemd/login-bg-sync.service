@@ -3,8 +3,9 @@ Description=Regenerate blurred login/lock backgrounds from current wallpaper
 
 [Service]
 Type=oneshot
-# Settling, serialization and skip-if-current all live in the script, so
-# rapid wallpaper cycling costs one regeneration, not one per wallpaper.
+# Serialization and converge-on-latest live in the script: concurrent runs
+# queue on a lock and each run re-reads the current wallpaper until the
+# outputs match it.
 ExecStart=%h/devcave/omarchy-setup/scripts/sync-login-bg.sh
 # The script updates the lock background and copies the SDDM background into
 # /usr/share/sddm/themes/macos/ (user-owned per login-and-lock-screens.md
