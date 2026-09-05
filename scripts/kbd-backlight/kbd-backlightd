@@ -206,8 +206,12 @@ def main() -> None:
                 on_command()
 
         if lit and time.monotonic() - last_input >= IDLE_SECS:
-            log(f"idle {IDLE_SECS}s: wrote 0 (L stays {L})")
-            write_led(0)
+            # lit was computed from the register at the top of this iteration;
+            # a duplicate write means the register read lagged the last write
+            # (EC round-trip), so re-read to suppress the duplicate.
+            if read_led() > 0:
+                log(f"idle {IDLE_SECS}s: wrote 0 (L stays {L})")
+                write_led(0)
 
 
 if __name__ == "__main__":
