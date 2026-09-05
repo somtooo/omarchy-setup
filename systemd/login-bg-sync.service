@@ -3,10 +3,10 @@ Description=Regenerate blurred login/lock backgrounds from current wallpaper
 
 [Service]
 Type=oneshot
-# Debounce: the theme switcher can swap the symlink more than once while
-# settling; wait for a quiet moment before doing the (CPU-heavy) blur.
-ExecStartPre=/bin/sleep 2
+# Settling, serialization and skip-if-current all live in the script, so
+# rapid wallpaper cycling costs one regeneration, not one per wallpaper.
 ExecStart=%h/devcave/omarchy-setup/scripts/sync-login-bg.sh
 # The script updates the lock background and copies the SDDM background into
 # /usr/share/sddm/themes/macos/ (user-owned per login-and-lock-screens.md
 # section 1, so no password needed). Both screens go live automatically.
+TimeoutStartSec=5min

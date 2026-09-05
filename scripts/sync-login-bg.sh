@@ -5,7 +5,44 @@
 # owned by the user (one-time setup: chown it, see login-and-lock-screens.md).
 set -euo pipefail
 
-BG="$(readlink -f "$HOME/.local/state/omarchy/current/background")"
+STATE="$HOME/.local/state/omarchy/current"
+CACHE_DIR="$HOME/.cache"
+MARKER="$CACHE_DIR/login-bg-sync.last"
+
+# Identity of the current wallpaper choice (source file + theme).
+choice_key() {
+  local bg
+  bg="$(readlink -f "$STATE/background" 2>/dev/null || true)"
+  printf '%s|%s|%s' "$bg" \
+    "$(stat -c '%s:%Y' "$bg" 2>/dev/null || echo missing)" \
+    "$(cat "$STATE/theme.name" 2>/dev/null || true)"
+}
+
+# Wait until the wallpaper choice is stable for 4s (cycling quickly through
+# wallpapers costs one regeneration, not one per wallpaper). Give up waiting
+# after ~40s and regenerate from whatever is current.
+prev=""; stable=0
+for _ in $(seq 1 40); do
+  cur="$(choice_key)"
+  if [[ $cur == "$prev" ]]; then
+    stable=$((stable + 1))
+    if ((stable >= 4)); then break; fi
+  else
+    stable=0; prev="$cur"
+  fi
+  sleep 1
+done
+
+# Serialize overlapping runs; skip if another run already handled this choice.
+mkdir -p "$CACHE_DIR"
+exec 9>"$CACHE_DIR/login-bg-sync.lock"
+flock 9
+if [[ -f $MARKER ]] && [[ $(cat "$MARKER") == "$(choice_key)" ]]; then
+  echo "Backgrounds already current — nothing to do."
+  exit 0
+fi
+
+BG="$(readlink -f "$STATE/background")"
 [[ -f $BG ]] || { echo "No current background found" >&2; exit 1; }
 echo "Source wallpaper: $BG"
 
@@ -24,6 +61,7 @@ magick "$BG" -resize 2560x2560^ -gravity center -extent 2560x2560 \
 SDDM_BG="/usr/share/sddm/themes/macos/background.jpg"
 if [[ -w $SDDM_BG ]]; then
   cp "$OUT_DIR/sddm-macos/background.jpg" "$SDDM_BG"
+  choice_key > "$MARKER"
   echo "Wrote:"
   echo "  $USER_DIR/lock-blur.jpg            (lock screen — live now)"
   echo "  $SDDM_BG (login screen — live now)"

@@ -153,7 +153,9 @@ systemctl --user enable --now login-bg-sync.path
 ```
 
 Both the lock screen and the SDDM login background update automatically from
-then on.
+then on. The script waits a few seconds for the wallpaper choice to settle
+before regenerating, so cycling quickly through several wallpapers costs one
+regeneration, not one per wallpaper.
 
 To change the avatar, replace `~/.local/share/login-look/avatar.png` (lock) and
 `/usr/share/sddm/themes/macos/avatar.png` (login). Generate a circular one from
