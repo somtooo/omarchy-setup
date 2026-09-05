@@ -2,28 +2,29 @@
 """kbd-backlightd: Dell-style keyboard backlight for ASUS laptops on Linux.
 
 One process, one thread, one selector event loop. All state lives in memory
-here, so races are impossible by construction: every event (input, command,
-timer) is processed atomically, one at a time.
+here; every event (input, command, timer) is processed atomically, one at a
+time, so races are impossible by construction.
 
-Invariant:
+State:
+    L           the user's chosen level (0..MAX). Written ONLY by the
+                up/down/off commands received on the control socket.
+                Persisted to disk (atomically) only when it changes.
+    last_input  timestamp of the last keyboard/touchpad event.
 
-    LED = L   if L > 0 and (now - last_input) < IDLE_SECS
-    LED = 0   otherwise
+The LED register is never trusted as a cache: it is READ on every input
+event and every timer tick, and written only when it disagrees with the
+invariant. Any external writer (the EC, asusd, brightnessctl) is therefore
+undone on the next event — interference is corrected, not tracked.
+Reads are ~1ms (WMI/EC round-trip); they happen only while typing or once
+per second while lit. Zero reads and zero CPU when dark and idle.
 
-L (the user's chosen level) is written ONLY by explicit up/down/off commands
-received on the control socket. Input events never write L. L is persisted
-atomically (os.replace) only when it changes.
-
-The EC's own brightness changes (hardware Fn keys, clearing the LED across
-suspend) are never adopted into L; the next event re-asserts the invariant.
-
-Runs as a system service (root). The OSD is shown by forking omarchy-osd
-with the graphical session's Wayland environment, discovered at runtime.
+Suspend/resume needs no handling at all: after wake, the register says
+whatever the EC/asusd left behind, the first input event reads it, finds it
+disagrees with L, and rewrites L. No clock tricks, no logind hooks.
 """
 
 import os
 import selectors
-import signal
 import socket
 import struct
 import sys
@@ -42,6 +43,10 @@ SOCKET_PATH = os.path.join(RUNTIME, "kbd-backlightd.sock")
 INPUT_EVENT = struct.Struct("qqHHi")  # sec, usec, type, code, value
 
 
+def log(msg: str) -> None:
+    print(f"kbd-backlightd: {msg}", file=sys.stderr, flush=True)
+
+
 def read_led() -> int:
     try:
         with open(LED_PATH) as f:
@@ -55,7 +60,7 @@ def write_led(level: int) -> None:
         with open(LED_PATH, "w") as f:
             f.write(str(level))
     except OSError as e:
-        print(f"kbd-backlightd: LED write failed: {e}", file=sys.stderr)
+        log(f"LED write failed: {e}")
 
 
 def load_L() -> int:
@@ -75,6 +80,8 @@ def save_L(level: int) -> None:
 
 
 def find_input_devices() -> list[str]:
+    """keyd virtual keyboard if keyd runs (it grabs the physical keyboard),
+    else the i8042 keyboard; plus the touchpad (keyd never grabs pointers)."""
     kbd = tpad = None
     for entry in os.listdir("/sys/class/input"):
         if not entry.startswith("event"):
@@ -93,38 +100,7 @@ def find_input_devices() -> list[str]:
     return [d for d in (kbd, tpad) if d]
 
 
-def _session_env() -> dict:
-    """Find the logged-in user's Wayland session env for the OSD fork."""
-    env = {}
-    try:
-        for uid in os.listdir("/run/user"):
-            rd = f"/run/user/{uid}"
-            if os.path.exists(os.path.join(rd, "wayland-1")):
-                env = {"XDG_RUNTIME_DIR": rd, "WAYLAND_DISPLAY": "wayland-1",
-                       "DBUS_SESSION_BUS_ADDRESS": f"unix:path={rd}/bus"}
-                break
-    except OSError:
-        pass
-    return env
-
-
-def show_osd(level: int) -> None:
-    env = _session_env()
-    if not env:
-        return
-    if os.fork() == 0:
-        try:
-            os.execvpe("omarchy-osd",
-                       ["omarchy-osd", "-i", "keyboard", "-p", str(level * 100 // MAX_LEVEL)],
-                       {**os.environ, **env})
-        except OSError:
-            pass
-        os._exit(0)
-
-
 def main() -> None:
-    signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # reap OSD children
-
     # Wait for the user's runtime dir (may not exist yet at early boot).
     for _ in range(120):
         if os.path.isdir(RUNTIME):
@@ -133,10 +109,8 @@ def main() -> None:
 
     L = load_L()
     last_input = time.monotonic()
-    # We have written nothing yet, but believe what the LED currently shows
-    # (e.g. systemd-backlight restored a level at boot) so the idle timer
-    # applies to it.
-    last_wrote = read_led()
+    log(f"start: L={L} register={read_led()}")
+
     sel = selectors.DefaultSelector()
 
     try:
@@ -146,23 +120,21 @@ def main() -> None:
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(SOCKET_PATH)
     # Socket lives in the user's runtime dir (mode 700), so only that user
-    # can reach it; 0666 on the socket itself lets the user-owned client
-    # connect to this root-owned daemon.
+    # can reach it; 0666 lets the user-owned client talk to this root daemon.
     os.chmod(SOCKET_PATH, 0o666)
     srv.listen()
     srv.setblocking(False)
     sel.register(srv, selectors.EVENT_READ, "cmd")
 
     def open_inputs() -> None:
-        """(Re)register input devices; safe to call when keyd restarts and
-        the virtual keyboard lands on a new event node."""
         for dev in find_input_devices():
             try:
                 fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
-            except OSError:
+            except OSError as e:
+                log(f"cannot open {dev}: {e}")
                 continue
             sel.register(fd, selectors.EVENT_READ, "input")
-            print(f"kbd-backlightd: watching {dev}", file=sys.stderr)
+            log(f"watching {dev} (fd {fd})")
 
     def close_inputs() -> None:
         for key in list(sel.get_map().values()):
@@ -174,57 +146,46 @@ def main() -> None:
                     pass
 
     def on_input() -> None:
-        nonlocal last_input, last_wrote
+        nonlocal last_input
         last_input = time.monotonic()
-        if L > 0 and last_wrote != L:
-            write_led(L)
-            last_wrote = L
+        if L > 0:
+            b = read_led()
+            if b != L:
+                write_led(L)
+                log(f"relight: register was {b}, wrote {L}")
 
     def on_command() -> None:
-        nonlocal L, last_input, last_wrote
+        nonlocal L, last_input
         last_input = time.monotonic()  # the keypress that sent this is input
         conn, _ = srv.accept()
         try:
             msg = conn.recv(16).decode().strip()
+            old = L
+            if msg == "up":
+                L = min(MAX_LEVEL, L + 1)
+            elif msg == "down":
+                L = max(0, L - 1)
+            elif msg == "off":
+                L = 0
+            else:
+                log(f"unknown command: {msg!r}")
+                return
+            if L != old:
+                save_L(L)
+            write_led(L)  # unconditional: a deliberate press should always apply
+            log(f"command {msg}: L {old} -> {L}")
+            # Reply with the level: the client (running in the user session)
+            # shows the OSD — root can't reach the Wayland socket.
+            conn.sendall(str(L).encode())
         finally:
             conn.close()
-        old = L
-        if msg == "up":
-            L = min(MAX_LEVEL, L + 1)
-        elif msg == "down":
-            L = max(0, L - 1)
-        elif msg == "off":
-            L = 0
-        else:
-            return
-        if L != old:
-            save_L(L)
-        write_led(L)   # unconditional: a deliberate press should always apply
-        last_wrote = L
-        show_osd(L)
-
-    # Resume detection: time.monotonic() freezes during deep sleep while wall
-    # clock (time.time()) keeps running. A jump in their delta = we slept, so
-    # the LED cache is invalid (the EC is not under our control during sleep).
-    wall_mono_delta = time.time() - time.monotonic()
 
     open_inputs()
 
     while True:
-        # Check sleep once per iteration, before anything else.
-        new_delta = time.time() - time.monotonic()
-        if abs(new_delta - wall_mono_delta) > 1.0:
-            # We slept: the EC may have touched the LED behind our back.
-            wall_mono_delta = new_delta
-            last_wrote = None
-            # keyd may have restarted and moved its virtual keyboard to a new
-            # event node; drop dead fds and re-scan.
-            close_inputs()
-            open_inputs()
-
-        lit = last_wrote not in (None, 0)
+        lit = read_led() > 0
         timeout = (max(0.0, IDLE_SECS - (time.monotonic() - last_input))
-                   if lit else None)  # dark: sleep until an event arrives
+                   if lit else 1.0)
 
         for key, _ in sel.select(timeout):
             if key.data == "input":
@@ -233,9 +194,10 @@ def main() -> None:
                         pass
                 except BlockingIOError:
                     pass
-                except OSError:
-                    # Dead device (e.g. keyd restarted): drop it so select
-                    # stops returning it, then re-scan for the new node.
+                except OSError as e:
+                    # Dead device (e.g. keyd restarted onto a new event node):
+                    # drop it so select stops returning it, then re-scan.
+                    log(f"input fd {key.fileobj} died: {e}; re-scanning")
                     close_inputs()
                     open_inputs()
                     continue
@@ -243,9 +205,9 @@ def main() -> None:
             else:
                 on_command()
 
-        if last_wrote not in (None, 0) and time.monotonic() - last_input >= IDLE_SECS:
+        if lit and time.monotonic() - last_input >= IDLE_SECS:
+            log(f"idle {IDLE_SECS}s: wrote 0 (L stays {L})")
             write_led(0)
-            last_wrote = 0
 
 
 if __name__ == "__main__":

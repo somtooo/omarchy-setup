@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """kbd-backlight: client for kbd-backlightd. Usage: kbd-backlight up|down|off
 
-Sends the command over the control socket. The daemon applies it atomically:
-updates L, writes the LED, persists L, shows the OSD.
+Sends the command over the control socket; the daemon applies it atomically
+(updates L, writes the LED, persists L) and replies with the new level. The
+client then shows the Omarchy OSD — it runs in the user session, which is
+where the Wayland socket is reachable (a root daemon cannot show the OSD).
 """
 import os
 import socket
+import subprocess
 import sys
 
 msg = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -17,4 +20,14 @@ path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.connect(path)
 s.sendall(msg.encode())
+reply = s.recv(16).decode().strip()
 s.close()
+
+try:
+    level = int(reply)
+except ValueError:
+    sys.exit(1)
+
+# Max level is 3 on ASUS kbd_backlight.
+subprocess.run(["omarchy-osd", "-i", "keyboard", "-p", str(level * 100 // 3)],
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
