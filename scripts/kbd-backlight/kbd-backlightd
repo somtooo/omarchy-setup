@@ -10,17 +10,21 @@ State:
                 up/down/off commands received on the control socket.
                 Persisted to disk (atomically) only when it changes.
     last_input  timestamp of the last keyboard/touchpad event.
+    last_wrote  the last value this daemon wrote to the LED (int), or None
+                when out of control (after sleep). Never a cache of what the
+                register says — the EC can change the register unobserved.
 
-The LED register is never trusted as a cache: it is READ on every input
-event and every timer tick, and written only when it disagrees with the
-invariant. Any external writer (the EC, asusd, brightnessctl) is therefore
-undone on the next event — interference is corrected, not tracked.
-Reads are ~1ms (WMI/EC round-trip); they happen only while typing or once
-per second while lit. Zero reads and zero CPU when dark and idle.
+All EC communication is direct sysfs (asus-nb-wmi driver → ACPI WMI → EC).
+asusctl was tested as an alternative transport and rejected: it adds a D-Bus
+round-trip but reaches the EC through the identical WMI method, and the EC
+drops its writes exactly the same way. Only the EC's internal Fn-key path is
+immune, and Linux cannot trigger that path.
 
-Suspend/resume needs no handling at all: after wake, the register says
-whatever the EC/asusd left behind, the first input event reads it, finds it
-disagrees with L, and rewrites L. No clock tricks, no logind hooks.
+Normal operation is pure cache trust: typing costs zero EC traffic.
+After sleep, a settle phase (SETTLE_SECS: touch nothing, let the EC finish)
+is followed by timer-driven send+check rounds with growing waits
+(SETTLE, SETTLE+5, …) until `asusctl leds get` agrees with L. Commands always
+write through, even in these phases.
 """
 
 import os
@@ -34,7 +38,8 @@ RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")
 STATE_HOME = "/var/lib/kbd-backlightd"
 
 IDLE_SECS = int(os.environ.get("IDLE_SECS", "30"))
-RECOVER_SECS = int(os.environ.get("RECOVER_SECS", "10"))
+SETTLE_SECS = int(os.environ.get("SETTLE_SECS", "2"))
+RETRY_STEP_SECS = int(os.environ.get("RETRY_STEP_SECS", "1"))
 LED_SYSFS = "/sys/class/leds/asus::kbd_backlight"
 LED_PATH = f"{LED_SYSFS}/brightness"
 MAX_LEVEL = int(open(f"{LED_SYSFS}/max_brightness").read())
@@ -53,7 +58,7 @@ def read_led() -> int:
         with open(LED_PATH) as f:
             return int(f.read())
     except (OSError, ValueError):
-        return 0
+        return -1  # unparseable: never equals a real level, forces retry
 
 
 def write_led(level: int) -> None:
@@ -69,7 +74,8 @@ def load_L() -> int:
         with open(STATE_FILE) as f:
             return max(0, min(MAX_LEVEL, int(f.read())))
     except (OSError, ValueError):
-        return read_led()  # first run: adopt current hardware level
+        b = read_led()  # first run: adopt current hardware level
+        return max(0, min(MAX_LEVEL, b)) if b >= 0 else 1
 
 
 def save_L(level: int) -> None:
@@ -113,7 +119,8 @@ def main() -> None:
     # Believe what the register shows at startup (e.g. systemd-backlight
     # restored a level at boot) so the idle timer applies to it.
     last_wrote = read_led()
-    recover_until = 0.0  # monotonic deadline; > now means recovery mode
+    retry_at = None  # next scheduled send+check round (monotonic), or None
+    retry_wait = SETTLE_SECS  # current wait; grows by RETRY_STEP_SECS per round
     log(f"start: L={L} register={last_wrote}")
 
     sel = selectors.DefaultSelector()
@@ -150,21 +157,45 @@ def main() -> None:
                 except (OSError, KeyError):
                     pass
 
+    def check_round() -> None:
+        """One send+check round: read the register and compare against L
+        (not zero — any level the daemon didn't write means interference).
+        On mismatch, write L and schedule the next round with a LONGER wait
+        (waits grow 10, 15, 20… so EC traffic decreases over time, never
+        accelerates). Repeats until the register agrees or the user walks
+        away (idle cancels the cycle)."""
+        nonlocal retry_at, retry_wait, last_wrote
+        if L == 0:
+            retry_at = None  # nothing to send; dark is correct
+            return
+        b = read_led()
+        if b == L:
+            last_wrote = L
+            retry_at = None
+            log(f"recovered: register confirmed {L}, in control")
+        else:
+            write_led(L)
+            retry_wait += RETRY_STEP_SECS
+            retry_at = time.monotonic() + retry_wait
+            log(f"retry: register was {b}, wrote {L}, next check in {retry_wait}s")
+
     def on_input() -> None:
-        nonlocal last_input, last_wrote
-        last_input = time.monotonic()
+        nonlocal last_input, last_wrote, retry_at
+        now = time.monotonic()
+        last_input = now
         if L == 0:
             return
-        if time.monotonic() < recover_until:
-            # Recovery mode (post-sleep): don't trust anything. Read the
-            # register; if it doesn't match L, someone else (EC, asusd) owns
-            # it — write L. Stay out of control until the window expires.
-            b = read_led()
-            if b != L:
-                write_led(L)
-                log(f"recovery: register was {b}, wrote {L}")
-            # last_wrote stays None until recovery ends
+        if retry_at is not None:
+            # Retry cycle active (post-resume): the timer drives send+check
+            # rounds. Keystrokes only refresh the idle clock — zero EC traffic.
+            return
+        if last_wrote is None:
+            # Out of control with no cycle (e.g. after idle-cancel): round now.
+            check_round()
         elif last_wrote != L:
+            # Normal operation: cache is trustworthy (no sleep happened), so
+            # write blind — no read. The post-resume retry cycle is the only
+            # place that reads before writing.
             write_led(L)
             last_wrote = L
             log(f"relight: wrote {L}")
@@ -188,12 +219,9 @@ def main() -> None:
             if L != old:
                 save_L(L)
             write_led(L)  # unconditional: a deliberate press should always apply
-            if time.monotonic() < recover_until:
-                # Recovery mode: stay out of control; the next input event
-                # will read the register and re-assert if needed.
-                last_wrote = None
-            else:
-                last_wrote = L
+            last_wrote = L
+            # A running retry cycle will verify this write on its next round;
+            # leave retry_at alone.
             log(f"command {msg}: L {old} -> {L}")
             # Reply with the level: the client (running in the user session)
             # shows the OSD — root can't reach the Wayland socket.
@@ -212,19 +240,27 @@ def main() -> None:
     while True:
         new_delta = time.time() - time.monotonic()
         if abs(new_delta - wall_mono_delta) > 5.0:
-            # We slept. The EC is mid-reset for a while after resume and may
-            # drop or undo writes — enter bounded recovery mode: input events
-            # verify their writes against the register until the deadline.
+            # We slept. Schedule the first send+check round SETTLE_SECS out:
+            # until then, touch nothing and let the EC finish whatever it's
+            # doing. The round reads first and writes only on mismatch; later
+            # rounds wait progressively longer (SETTLE, +RETRY_STEP each time)
+            # so EC traffic only decreases.
             log(f"resume detected (clock delta jumped {new_delta - wall_mono_delta:+.1f}s); "
-                f"recovering for {RECOVER_SECS}s")
+                f"first check in {SETTLE_SECS}s")
             wall_mono_delta = new_delta
             last_wrote = None
             last_input = time.monotonic()  # pre-sleep idle time doesn't count
-            recover_until = time.monotonic() + RECOVER_SECS
+            retry_wait = SETTLE_SECS
+            retry_at = time.monotonic() + retry_wait
 
         lit = isinstance(last_wrote, int) and last_wrote > 0
-        timeout = (max(0.0, IDLE_SECS - (time.monotonic() - last_input))
-                   if lit else None)  # dark: sleep until an event arrives
+        now = time.monotonic()
+        deadlines = []
+        if lit:
+            deadlines.append(last_input + IDLE_SECS)
+        if retry_at is not None:
+            deadlines.append(retry_at)
+        timeout = max(0.0, min(deadlines) - now) if deadlines else None
 
         for key, _ in sel.select(timeout):
             if key.data == "input":
@@ -244,7 +280,16 @@ def main() -> None:
             else:
                 on_command()
 
-        if lit and time.monotonic() - last_input >= IDLE_SECS:
+        now = time.monotonic()
+        if now - last_input >= IDLE_SECS:
+            # User walked away: stop any retry cycle — pointless to keep
+            # sending while nobody is here. Next keystroke restarts it.
+            retry_at = None
+        if retry_at is not None and now >= retry_at:
+            check_round()
+            # recompute: the round may have set last_wrote / cleared retry_at
+            lit = isinstance(last_wrote, int) and last_wrote > 0
+        if lit and now - last_input >= IDLE_SECS:
             log(f"idle {IDLE_SECS}s: wrote 0 (L stays {L})")
             write_led(0)
             last_wrote = 0
