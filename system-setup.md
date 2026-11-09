@@ -544,10 +544,16 @@ This installs:
   a plain `suspend` on lid close, which never hibernates.
 
 The menu's Suspend item runs plain `systemctl suspend` by default. Override it
-in `~/.config/omarchy/extensions/omarchy-menu.jsonc`, then `omarchy-menu refresh`:
+in `~/.config/omarchy/extensions/omarchy-menu.jsonc`, then `omarchy-menu refresh`.
+The override replaces the whole item, so copy every field from the default
+(`~/.local/share/omarchy/default/omarchy/omarchy-menu.jsonc`), or the menu
+shows the raw id `system.suspend`:
 
 ```jsonc
   "system.suspend": {
+    "icon": "󰒲",
+    "label": "Suspend",
+    "when": "! omarchy-toggle-enabled suspend-off",
     "action": "systemctl suspend-then-hibernate"
   }
 ```
