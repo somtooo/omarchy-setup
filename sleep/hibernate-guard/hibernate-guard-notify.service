@@ -1,0 +1,11 @@
+[Unit]
+Description=Tell the user hibernation is off for this boot
+After=graphical-session.target
+ConditionPathExists=/run/hibernate-guard-active
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/notify-send -u normal -i system-reboot "Hibernation off until reboot" "The firmware logged an error after the last forced power-off. Suspend still works. Reboot once to re-enable hibernation."
+
+[Install]
+WantedBy=graphical-session.target

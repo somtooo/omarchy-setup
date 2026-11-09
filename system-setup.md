@@ -426,42 +426,60 @@ separate legacy suspend or hypridle service.
 
 ### 19. Sleep, Suspend, and Hibernation
 
-> **Hardware:** ASUS ROG Zephyrus G16 GU605CR (Intel Core Ultra 9 285H + NVIDIA
-> RTX 5070 Ti Mobile, hybrid Intel iGPU + NVIDIA dGPU, Limine UKI, encrypted
-> Btrfs `/` on `/dev/mapper/root`, swapfile at `/swap/swapfile`).
+> **Hardware:** ASUS ROG Zephyrus G16 GU605CR, BIOS 311 (Intel Core Ultra 9
+> 285H + NVIDIA RTX 5070 Ti Mobile, hybrid Intel iGPU + NVIDIA dGPU, Limine UKI,
+> encrypted Btrfs `/` on `/dev/mapper/root`, swapfile at `/swap/swapfile`).
+> Driver: `nvidia-open-dkms` 615.78.08.
 >
-> Goal: lid close / idle suspends in **s2idle** for a fast wake, auto-hibernates
-> to disk after 35 min (zero battery drain), and **powers off cleanly**. Explicit
-> `systemctl hibernate` also powers off. Resume restores the full session.
+> Goal: lid close / menu Suspend goes into **deep (S3)** sleep, hibernates to
+> disk after 35 min, and hibernate **powers off cleanly**. Resume restores the
+> full session.
 
-Apply all of the following.
+Files for this section live in [`sleep/`](sleep/).
 
-**1. NVIDIA hibernate support.** Shadow the packaged `nvidia-sleep.conf` (same
-filename in `/etc/modprobe.d/` replaces the packaged one) with two options:
+**1. NVIDIA sleep options and services.** Shadow the packaged
+`nvidia-sleep.conf` (same filename in `/etc/modprobe.d/` replaces it):
 
-- `NVreg_UseKernelSuspendNotifiers=0` — makes the driver's `/proc/driver/nvidia/suspend`
-  interface exist (the packaged `=1` suppresses it and breaks suspend/hibernate).
-- `NVreg_EnableS0ixPowerManagement=1` — lets the dGPU enter its deep low-power
-  state during S4 **even while an app is holding it** (e.g. a terminal renderer
-  like Warp keeps the GPU active). Without this, hibernate writes the image but
-  the platform S4 power-off bounces and the laptop stays on. This makes
-  power-off deterministic regardless of GPU activity.
+- `NVreg_UseKernelSuspendNotifiers=0` makes `/proc/driver/nvidia/suspend`
+  exist (the packaged `=1` suppresses it and breaks suspend/hibernate).
+- `NVreg_TemporaryFilePath=/var/tmp` puts the VRAM dump on disk (the `/tmp`
+  default is tmpfs, too small for 12 GB).
+- Keep `NVreg_PreserveVideoMemoryAllocations=1` (packaged default). With `0`,
+  hibernate silently skips writing the image.
 
 ```bash
 pkexec bash -c 'cat > /etc/modprobe.d/nvidia-sleep.conf << "EOF"
-options nvidia NVreg_UseKernelSuspendNotifiers=0 NVreg_EnableS0ixPowerManagement=1
+options nvidia NVreg_UseKernelSuspendNotifiers=0 NVreg_EnableS0ixPowerManagement=1 NVreg_TemporaryFilePath=/var/tmp
 EOF'
 
-# Enable the NVIDIA sleep services (drive the procfs interface around sleep).
 pkexec systemctl enable nvidia-hibernate.service nvidia-resume.service nvidia-suspend.service nvidia-suspend-then-hibernate.service
 
-# Remove nvidia from the initramfs (early KMS breaks hibernate with VRAM
-# preservation). The internal panel uses the Intel iGPU, so LUKS/Plymouth are
-# unaffected; nvidia loads in normal userspace a few seconds into boot.
+# Keep nvidia out of the initramfs (early KMS breaks hibernate resume).
 pkexec bash -c 'mv /etc/mkinitcpio.conf.d/nvidia.conf /etc/mkinitcpio.conf.d/nvidia.conf.disabled && limine-mkinitcpio'
 ```
 
-**2. Keyboard backlight off before hibernate.** The ASUS EC stalls power-off
+**2. Patch the NVIDIA driver so hibernate can power off.** This is the real
+fix for "hibernate writes the image but the laptop never turns off".
+`HibernateMode=shutdown` ends in `kernel_power_off()` → `device_shutdown()` →
+`nv_pci_shutdown()`, which runs `nv_linux_stop_open_q()` and
+`nvidia_modeset_remove()` → `nv_drm_dev_unload()`. That waits forever on an
+nvkms modeset lock. The driver already bails out on this path when the GPU is
+in use, but only *after* those calls. The patch moves the same check in front
+of them. Source: [NVIDIA forum thread, post #5](https://forums.developer.nvidia.com/t/hibernate-never-powers-off-stuck-in-nv-pci-shutdown-nv-drm-dev-unload-rtx-5070-laptop-nvidia-open-610-57/382485).
+
+```bash
+pkexec ./sleep/nvidia-shutdown-fix/apply.sh   # patch, rebuild DKMS for all kernels, verify
+# full reboot afterwards (not a hibernate/resume)
+```
+
+The script is pinned to 615.78.08 and **must be re-run after every
+`nvidia-open-dkms` update** (the update replaces the source). Bump `VER` in
+`apply.sh`/`revert.sh` and check the patch still applies. Gotchas hit while
+building it: `dkms install --force` alone reuses the old build (use `dkms build
+--force` first), and `grep -q` under `pipefail` reports a false failure.
+`revert.sh` undoes it.
+
+**3. Keyboard backlight off before hibernate.** The ASUS EC stalls power-off
 while the keyboard backlight is on; Omarchy ships the hook but not executable.
 Re-apply after Omarchy updates until fixed upstream:
 
@@ -469,31 +487,38 @@ Re-apply after Omarchy updates until fixed upstream:
 pkexec chmod +x /usr/lib/systemd/system-sleep/keyboard-backlight
 ```
 
-**3. Power off via shutdown, not ACPI S4.** Belt-and-suspenders alongside step 1:
-`HibernateMode=shutdown` writes the same image, then powers off via the normal
-kernel path instead of asking the firmware for S4:
+**4. Hibernate via shutdown, after 35 min of suspend.**
 
 ```bash
-pkexec bash -c 'mkdir -p /etc/systemd/sleep.conf.d && cat > /etc/systemd/sleep.conf.d/hibernate-mode.conf << "EOF"
-[Sleep]
-HibernateMode=shutdown
-EOF'
+pkexec bash -c 'mkdir -p /etc/systemd/sleep.conf.d
+printf "[Sleep]\nHibernateMode=shutdown\n" > /etc/systemd/sleep.conf.d/hibernate-mode.conf
+printf "[Sleep]\nHibernateDelaySec=35min\n" > /etc/systemd/sleep.conf.d/hibernate-delay.conf'
 ```
 
-**4. Hibernate after 35 min in suspend.** logind already prefers
-suspend-then-hibernate, so lid close / idle uses it automatically — s2idle for
-a quick wake, hibernate after the delay:
+**5. Deep sleep, lid close, and the hibernate guard.**
 
 ```bash
-pkexec bash -c 'cat > /etc/systemd/sleep.conf.d/hibernate-delay.conf << "EOF"
-[Sleep]
-HibernateDelaySec=35min
-EOF'
+pkexec ./sleep/install.sh      # undo: pkexec ./sleep/uninstall.sh
 ```
 
-**5. Keep the default s2idle sleep state.** Do **not** add
-`mem_sleep_default=deep` to the kernel cmdline — this platform advertises S3
-but hangs on resume from it. The default (s2idle) is correct.
+This installs:
+
+- `MemorySleepMode=deep`: s2idle drained the battery; S3 resumes fine on BIOS
+  311. (An earlier note here said S3 hangs; that hang was a dead NVIDIA GPU,
+  see the guard below, not S3.)
+- `HandleLidSwitch=suspend-then-hibernate` (also on AC). By default logind does
+  a plain `suspend` on lid close, which never hibernates.
+- **hibernate-guard**: disables hibernation for one boot after a forced
+  power-off. See "Why the guard exists" below.
+
+The menu's Suspend item runs plain `systemctl suspend` by default. Override it
+in `~/.config/omarchy/extensions/omarchy-menu.jsonc`, then `omarchy-menu refresh`:
+
+```jsonc
+  "system.suspend": {
+    "action": "if [ -e /run/hibernate-guard-active ]; then systemctl suspend; else systemctl suspend-then-hibernate; fi"
+  }
+```
 
 **6. Stop the lock-before-suspend service from hanging suspend.** Omarchy 4.0.2's
 `omarchy-sleep-lock.service` crash-loops (holding a sleep inhibitor) when the
@@ -513,35 +538,59 @@ EOF'
 systemctl --user daemon-reload
 ```
 
-Reboot once for the cmdline and module changes to take effect.
+#### Why the guard exists
+
+Symptom: after resuming from hibernate, about 3 minutes later the dGPU dies.
+The log shows `ACPI Error: Aborting method \_SB.PC00.RP12.PXSX._DSM`
+(`AE_AML_NO_RETURN_VALUE`, "Result stack is empty"), then
+`gpuGc6EntryGpuPowerOff_IMPL: Call to power off GPU failed`, then a flood of
+`GspRmFree failed` / `rpcSendMessage failed`. Anything sleep-related after that
+hangs (`nvidia-sleep.sh` blocks on an RM lock), so suspend looks like "screen
+off, fans on".
+
+Cause: after a forced power-off the firmware adds a **BERT** table (CPU
+machine-check records) on the next boot. That shifts every later ACPI table
+down one page; the NVIDIA table `OptRf2 Opt2Tabl` (`SSDT25`, holds the JT/GC6
+`_DSM`) moves from `0x67F3C000` to `0x67F3B000`. Linux executes AML straight
+from table memory, which is not in the hibernate image. Hibernate from a BERT
+boot, and the clean resume boot puts the tables back, so the restored kernel
+runs the GC6 power-off (`NVJT` fn 3 → `GC6I`) from the wrong bytes.
+
+Evidence from 40 boots: all 3 hibernates in a BERT boot hit the failure; ~20
+hibernates in normal boots never did. One reboot clears the BERT.
+
+The guard (`hibernate-guard.service`) runs at boot. If
+`/sys/firmware/acpi/tables/BERT` exists, it writes runtime-only drop-ins in
+`/run` (`AllowHibernation=no`, `AllowSuspendThenHibernate=no`, lid →
+`suspend`), touches `/run/hibernate-guard-active`, and a user unit posts a
+notification. Everything resets on the next reboot.
 
 #### Verify
 
 ```bash
-cat /proc/driver/nvidia/params | grep -E "PreserveVideoMemoryAllocations|UseKernelSuspendNotifiers"
+grep -E "PreserveVideoMemoryAllocations|UseKernelSuspendNotifiers" /proc/driver/nvidia/params
 # expect: PreserveVideoMemoryAllocations: 1, UseKernelSuspendNotifiers: 0
-ls /proc/driver/nvidia/suspend                                       # exists
-lsinitcpio -l /boot/EFI/Linux/omarchy_linux.efi | grep -c nvidia.ko  # 0
-cat /sys/power/mem_sleep          # [s2idle] deep
-cat /sys/power/disk               # contains [shutdown]
-systemctl is-enabled nvidia-hibernate nvidia-resume nvidia-suspend nvidia-suspend-then-hibernate
-stat -c %A /usr/lib/systemd/system-sleep/keyboard-backlight           # -rwxr-xr-x
+zstd -dc /usr/lib/modules/$(uname -r)/updates/dkms/nvidia.ko.zst | strings | grep -c "Hibernate shutdown fix"  # 1
+cat /sys/power/mem_sleep          # s2idle [deep]  (set at sleep time by systemd)
+systemd-analyze cat-config systemd/sleep.conf | grep -E "^(MemorySleepMode|HibernateMode|HibernateDelaySec)"
+busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch
+systemctl is-enabled hibernate-guard nvidia-hibernate nvidia-resume nvidia-suspend
+ls /run/hibernate-guard-active    # exists only in a boot after a forced power-off
 
-# Hibernate test (save work first): writes image, powers OFF by itself.
+# Hibernate test: writes the image, powers OFF by itself.
 systemctl hibernate
-# Power on -> LUKS -> SDDM login -> session restored.
+# After resume, wait 5 min idle, then expect 0:
+journalctl -b -k | grep -c "power off GPU failed"
 
-# Suspend-then-hibernate test (optional): temporarily set HibernateDelaySec=3min,
-# run `systemctl suspend-then-hibernate`, leave it ~3 min. It wakes itself,
-# writes the image (screen stays on a few minutes — do not hard-reset), then
-# powers off. Set the delay back to 35min afterward.
+# Deep suspend test:
+systemctl suspend && journalctl -b -k | grep "suspend entry (deep)"
 ```
 
 Notes:
-- Use `systemctl suspend-then-hibernate` to test the timed path; plain
-  `systemctl suspend` only does s2idle and never hibernates.
+- To test the timed path, temporarily set `HibernateDelaySec=3min` and run
+  `systemctl suspend-then-hibernate`.
 - Resume-from-hibernate always lands on the SDDM login (expected on an
-  encrypted disk) — the session is restored after you log in.
+  encrypted disk). The session is restored after you log in.
 - After many failed login/sudo attempts, PAM `pam_faillock` bans the account
   for 2 minutes and rejects even the correct password. If the lock screen or
   sudo suddenly rejects a known-good password, wait 2 minutes and retry.

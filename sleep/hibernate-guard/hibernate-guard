@@ -1,0 +1,33 @@
+#!/bin/bash
+# Disable hibernation for this boot when the firmware added a BERT table.
+#
+# After a forced power-off the ASUS firmware adds a BERT (boot error record)
+# table on the next boot, which shifts every later ACPI table down one page.
+# Hibernate from that boot, and the resume boot (clean, no BERT) puts the tables
+# back. The restored kernel then runs the NVIDIA GC6 _DSM from the old address,
+# the call fails, and the dGPU is lost. Rebooting once clears the BERT.
+set -euo pipefail
+
+BERT=/sys/firmware/acpi/tables/BERT
+FLAG=/run/hibernate-guard-active
+
+[ -e "$BERT" ] || exit 0
+
+mkdir -p /run/systemd/sleep.conf.d /run/systemd/logind.conf.d
+
+cat > /run/systemd/sleep.conf.d/90-hibernate-guard.conf <<'EOF'
+[Sleep]
+AllowHibernation=no
+AllowSuspendThenHibernate=no
+AllowHybridSleep=no
+EOF
+
+# Lid would otherwise ask for suspend-then-hibernate, which is now refused.
+cat > /run/systemd/logind.conf.d/90-hibernate-guard.conf <<'EOF'
+[Login]
+HandleLidSwitch=suspend
+HandleLidSwitchExternalPower=suspend
+EOF
+
+touch "$FLAG"
+echo "BERT present: hibernation disabled until next reboot"

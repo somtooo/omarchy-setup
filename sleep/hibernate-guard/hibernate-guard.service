@@ -1,0 +1,13 @@
+[Unit]
+Description=Disable hibernation after a firmware error boot (ACPI BERT present)
+DefaultDependencies=no
+After=local-fs.target
+Before=systemd-logind.service
+ConditionPathExists=/sys/firmware/acpi/tables/BERT
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hibernate-guard
+
+[Install]
+WantedBy=multi-user.target
