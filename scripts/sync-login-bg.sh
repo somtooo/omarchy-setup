@@ -20,7 +20,7 @@ LOCK="$CACHE/login-bg-sync.lock"
 
 OUT_DIR="$HOME/devcave/login-customization"
 USER_DIR="$HOME/.local/share/login-look"
-SDDM_BG="/usr/share/sddm/themes/macos/background.jpg"
+SDDM_BG="/usr/share/sddm/themes/macos/background.jpg
 
 mkdir -p "$CACHE" "$USER_DIR" "$OUT_DIR/sddm-macos"
 

@@ -92,7 +92,7 @@ setsid nohup ~/.local/bin/quattrobar-autohide >/dev/null 2>&1 &
 In `Bar.qml`, inside `component BarPanel`:
 
 | Knob | Property | Default |
-|---|---|---|
+| --- | --- | --- |
 | Side gap | `pillMargin` | `Style.space(4)` |
 | Top gap | `pillTopMargin` | `Style.space(4)` |
 | Shadow room | `pillShadowPad` | `Style.space(10)` |
@@ -101,11 +101,24 @@ In `Bar.qml`, inside `component BarPanel`:
 | Glass (transparent mode) | pill `color` first branch | alpha `0.45` |
 | Shadow | `MultiEffect` in `layer.effect` | blur 1.0, y 6 |
 
-After editing `Bar.qml`, reload the bar and check for errors:
+
+After editing `Bar.qml` reload the bar and check for errors:
 
 ```bash
 omarchy restart shell
 journalctl --user -b | grep som2.bar
+```
+The estimator is $\hat{\beta} = (X^\top X)^{-1} X^\top y$, and its variance is
+
+$$
+\operatorname{Var}(\hat{\beta}) = \sigma^2 (X^\top X)^{-1}
+$$
+
+```mermaid
+flowchart LR
+  notes[Notes] --> draft[Draft]
+  draft --> pdf[PDF]
+  refs[(refs.bib)] --> draft
 ```
 
 ## Revert
@@ -119,3 +132,4 @@ rm -rf ~/.config/omarchy/plugins/som2.bar
 
 And restore the stock autohide nudge target (`omarchy.bar`) in
 `~/.local/bin/quattrobar-autohide` if you keep using it.
+![A figure|572](./screenshot-2026-10-29_21-15-09.png)
