@@ -91,6 +91,40 @@ hardware and sends nothing to Linux — see [19b](#19b-keyboard-backlight-on-whi
 
 ---
 
+### 3c. Fix Touchpad Palm Jumps While Typing (keyd + disable-while-typing)
+
+Symptom: while typing, a palm brushes the touchpad and the cursor jumps.
+Hyprland's `disable_while_typing` is on (default), but it never fires.
+
+Cause: libinput only pauses an internal touchpad for typing on an *internal*
+keyboard. keyd grabs the real keyboards (`ITE Device 0b05:19b6`, `AT Translated
+Set 2`) and re-emits keys from `keyd virtual keyboard`, which has no
+`ID_INTEGRATION`, so libinput treats it as external and never pairs it with
+the touchpad. (The ASUS `0b05:19b6` quirk from the
+[CachyOS thread](https://discuss.cachyos.org/t/trying-to-get-libinput-to-respect-disable-while-typing-for-touchpad-setting/10030)
+already ships upstream in `50-system-asus.quirks`; that is not the problem here.)
+
+Fix: mark keyd's virtual keyboard as internal.
+
+```bash
+pkexec bash -c 'mkdir -p /etc/libinput && cat > /etc/libinput/local-overrides.quirks << "EOF"
+# Treat keyd'"'"'s virtual keyboard as the laptop'"'"'s built-in keyboard so the
+# touchpad'"'"'s disable-while-typing works.
+[keyd virtual keyboard]
+MatchUdevType=keyboard
+MatchName=keyd*keyboard
+AttrKeyboardIntegration=internal
+EOF'
+```
+
+Log out and back in (or reboot). Verify, with `libinput-tools` installed:
+
+```bash
+sudo libinput quirks list /dev/input/$(grep -l "keyd virtual keyboard" /sys/class/input/event*/device/name | cut -d/ -f5)
+# expect: AttrKeyboardIntegration=internal
+sudo libinput debug-events --verbose 2>&1 | grep -i dwt   # type: "dwt activated"
+```
+
 ## Restore Configurations
 
 ### 4. Restore Dotfiles
@@ -495,7 +529,7 @@ printf "[Sleep]\nHibernateMode=shutdown\n" > /etc/systemd/sleep.conf.d/hibernate
 printf "[Sleep]\nHibernateDelaySec=35min\n" > /etc/systemd/sleep.conf.d/hibernate-delay.conf'
 ```
 
-**5. Deep sleep, lid close, and the hibernate guard.**
+**5. Deep sleep and lid close.**
 
 ```bash
 pkexec ./sleep/install.sh      # undo: pkexec ./sleep/uninstall.sh
@@ -505,18 +539,16 @@ This installs:
 
 - `MemorySleepMode=deep`: s2idle drained the battery; S3 resumes fine on BIOS
   311. (An earlier note here said S3 hangs; that hang was a dead NVIDIA GPU,
-  see the guard below, not S3.)
+  see "GPU dies after resume" below, not S3.)
 - `HandleLidSwitch=suspend-then-hibernate` (also on AC). By default logind does
   a plain `suspend` on lid close, which never hibernates.
-- **hibernate-guard**: disables hibernation for one boot after a forced
-  power-off. See "Why the guard exists" below.
 
 The menu's Suspend item runs plain `systemctl suspend` by default. Override it
 in `~/.config/omarchy/extensions/omarchy-menu.jsonc`, then `omarchy-menu refresh`:
 
 ```jsonc
   "system.suspend": {
-    "action": "if [ -e /run/hibernate-guard-active ]; then systemctl suspend; else systemctl suspend-then-hibernate; fi"
+    "action": "systemctl suspend-then-hibernate"
   }
 ```
 
@@ -538,7 +570,7 @@ EOF'
 systemctl --user daemon-reload
 ```
 
-#### Why the guard exists
+#### GPU dies after resume (only after a forced power-off): just reboot
 
 Symptom: after resuming from hibernate, about 3 minutes later the dGPU dies.
 The log shows `ACPI Error: Aborting method \_SB.PC00.RP12.PXSX._DSM`
@@ -557,13 +589,13 @@ boot, and the clean resume boot puts the tables back, so the restored kernel
 runs the GC6 power-off (`NVJT` fn 3 → `GC6I`) from the wrong bytes.
 
 Evidence from 40 boots: all 3 hibernates in a BERT boot hit the failure; ~20
-hibernates in normal boots never did. One reboot clears the BERT.
+hibernates in normal boots never did.
 
-The guard (`hibernate-guard.service`) runs at boot. If
-`/sys/firmware/acpi/tables/BERT` exists, it writes runtime-only drop-ins in
-`/run` (`AllowHibernation=no`, `AllowSuspendThenHibernate=no`, lid →
-`suspend`), touches `/run/hibernate-guard-active`, and a user unit posts a
-notification. Everything resets on the next reboot.
+Nothing is left broken. It only happens when you hibernate in the first boot
+after a forced power-off, and one normal reboot clears the BERT and restores
+everything. If the GPU dies after a resume, reboot (don't suspend; that will
+hang). To check whether the current boot is a BERT boot:
+`ls /sys/firmware/acpi/tables/BERT`.
 
 #### Verify
 
@@ -574,8 +606,7 @@ zstd -dc /usr/lib/modules/$(uname -r)/updates/dkms/nvidia.ko.zst | strings | gre
 cat /sys/power/mem_sleep          # s2idle [deep]  (set at sleep time by systemd)
 systemd-analyze cat-config systemd/sleep.conf | grep -E "^(MemorySleepMode|HibernateMode|HibernateDelaySec)"
 busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch
-systemctl is-enabled hibernate-guard nvidia-hibernate nvidia-resume nvidia-suspend
-ls /run/hibernate-guard-active    # exists only in a boot after a forced power-off
+systemctl is-enabled nvidia-hibernate nvidia-resume nvidia-suspend
 
 # Hibernate test: writes the image, powers OFF by itself.
 systemctl hibernate
