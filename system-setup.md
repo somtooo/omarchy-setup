@@ -465,7 +465,7 @@ separate legacy suspend or hypridle service.
 > encrypted Btrfs `/` on `/dev/mapper/root`, swapfile at `/swap/swapfile`).
 > Driver: `nvidia-open-dkms` 615.78.08.
 >
-> Goal: lid close / menu Suspend goes into **deep (S3)** sleep, hibernates to
+> Goal: lid close / menu Suspend goes into **s2idle** sleep, hibernates to
 > disk after 35 min, and hibernate **powers off cleanly**. Resume restores the
 > full session.
 
@@ -529,19 +529,23 @@ printf "[Sleep]\nHibernateMode=shutdown\n" > /etc/systemd/sleep.conf.d/hibernate
 printf "[Sleep]\nHibernateDelaySec=35min\n" > /etc/systemd/sleep.conf.d/hibernate-delay.conf'
 ```
 
-**5. Deep sleep and lid close.**
+**5. Lid close suspends, then hibernates.**
 
 ```bash
 pkexec ./sleep/install.sh      # undo: pkexec ./sleep/uninstall.sh
 ```
 
-This installs:
+This sets `HandleLidSwitch=suspend-then-hibernate` (also on AC). By default
+logind does a plain `suspend` on lid close, which never hibernates. s2idle
+drains the battery, so the 35 min hibernate is what stops the drain.
 
-- `MemorySleepMode=deep`: s2idle drained the battery; S3 resumes fine on BIOS
-  311. (An earlier note here said S3 hangs; that hang was a dead NVIDIA GPU,
-  see "GPU dies after resume" below, not S3.)
-- `HandleLidSwitch=suspend-then-hibernate` (also on AC). By default logind does
-  a plain `suspend` on lid close, which never hibernates.
+**Do not use deep (S3) sleep** (`MemorySleepMode=deep` or
+`mem_sleep_default=deep`). Short S3 cycles (1-2 min) resume fine, but after
+35 min in S3 the GPU's GSP firmware fails to boot on resume
+(`Fatal GSP-FMC Error ... error code=0x83d`, `GSP boot failed at resume
+(bootMode 0x2): 0x55`, `GPU is unable to transition from GC6 to D0`), then
+`Xid 119` GSP timeouts, the scheduled hibernate never happens, and the laptop
+resets itself a minute later. s2idle: ~170 suspends, zero GPU failures.
 
 The menu's Suspend item runs plain `systemctl suspend` by default. Override it
 in `~/.config/omarchy/extensions/omarchy-menu.jsonc`, then `omarchy-menu refresh`.
@@ -609,7 +613,7 @@ hang). To check whether the current boot is a BERT boot:
 grep -E "PreserveVideoMemoryAllocations|UseKernelSuspendNotifiers" /proc/driver/nvidia/params
 # expect: PreserveVideoMemoryAllocations: 1, UseKernelSuspendNotifiers: 0
 zstd -dc /usr/lib/modules/$(uname -r)/updates/dkms/nvidia.ko.zst | strings | grep -c "Hibernate shutdown fix"  # 1
-cat /sys/power/mem_sleep          # s2idle [deep]  (set at sleep time by systemd)
+cat /sys/power/mem_sleep          # [s2idle] deep
 systemd-analyze cat-config systemd/sleep.conf | grep -E "^(MemorySleepMode|HibernateMode|HibernateDelaySec)"
 busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager HandleLidSwitch
 systemctl is-enabled nvidia-hibernate nvidia-resume nvidia-suspend
@@ -619,8 +623,8 @@ systemctl hibernate
 # After resume, wait 5 min idle, then expect 0:
 journalctl -b -k | grep -c "power off GPU failed"
 
-# Deep suspend test:
-systemctl suspend && journalctl -b -k | grep "suspend entry (deep)"
+# Suspend test:
+systemctl suspend && journalctl -b -k | grep "suspend entry (s2idle)"
 ```
 
 Notes:
