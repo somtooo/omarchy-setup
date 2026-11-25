@@ -468,9 +468,10 @@ separate legacy suspend or hypridle service.
 > encrypted Btrfs `/` on `/dev/mapper/root`, swapfile at `/swap/swapfile`).
 > Driver: `nvidia-open-dkms` 615.78.08.
 >
-> Goal: lid close / menu Suspend goes into **s2idle** sleep, hibernates to
-> disk after 35 min, and hibernate **powers off cleanly**. Resume restores the
-> full session.
+> Goal: after 10 minutes idle, show the screensaver; lock at 15 minutes; then
+> start **s2idle suspend-then-hibernate** at 30 minutes idle. Hibernate powers
+> off cleanly after 30 minutes suspended. Lid close and menu Suspend use the
+> same 30-minute suspend-then-hibernate policy.
 
 Files for this section live in [`sleep/`](sleep/).
 
@@ -524,12 +525,12 @@ Re-apply after Omarchy updates until fixed upstream:
 pkexec chmod +x /usr/lib/systemd/system-sleep/keyboard-backlight
 ```
 
-**4. Hibernate via shutdown, after 35 min of suspend.**
+**4. Hibernate via shutdown, after 30 min of suspend.**
 
 ```bash
 pkexec bash -c 'mkdir -p /etc/systemd/sleep.conf.d
 printf "[Sleep]\nHibernateMode=shutdown\n" > /etc/systemd/sleep.conf.d/hibernate-mode.conf
-printf "[Sleep]\nHibernateDelaySec=35min\n" > /etc/systemd/sleep.conf.d/hibernate-delay.conf'
+printf "[Sleep]\nHibernateDelaySec=30min\n" > /etc/systemd/sleep.conf.d/hibernate-delay.conf'
 ```
 
 **5. Lid close suspends, then hibernates.**
@@ -540,7 +541,7 @@ pkexec ./sleep/install.sh      # undo: pkexec ./sleep/uninstall.sh
 
 This sets `HandleLidSwitch=suspend-then-hibernate` (also on AC). By default
 logind does a plain `suspend` on lid close, which never hibernates. s2idle
-drains the battery, so the 35 min hibernate is what stops the drain.
+drains the battery, so hibernating after 30 minutes stops the drain.
 
 **Do not use deep (S3) sleep** (`MemorySleepMode=deep` or
 `mem_sleep_default=deep`). Short S3 cycles (1-2 min) resume fine, but after
@@ -565,7 +566,35 @@ shows the raw id `system.suspend`:
   }
 ```
 
-**6. Stop the lock-before-suspend service from hanging suspend.** Omarchy 4.0.2's
+**6. Idle screensaver, lock, suspend, and hibernate.** The Omarchy shell
+measures the screensaver and lock delays from the start of user inactivity.
+Set the `idle` values in `~/.config/omarchy/shell.json` to:
+
+```json
+"idle": {
+  "screensaver": 600,
+  "lock": 900
+}
+```
+
+Hypridle handles the later idle-suspend action. Set its listener in
+`~/.config/hypr/hypridle.conf` to:
+
+```ini
+listener {
+    timeout = 1800
+    on-timeout = systemctl suspend-then-hibernate
+}
+```
+
+This starts suspend 30 minutes after idle begins, 15 minutes after the lock.
+`HibernateDelaySec=30min` then starts hibernation 30 minutes after suspend
+begins. Restart Hypridle after editing with
+`systemctl --user restart hypridle.service`; the Omarchy shell reloads its
+settings on save. OpenCode can hold a `sleep:idle` inhibitor while an agent is
+running, which can block automatic idle sleep until the agent releases it.
+
+**7. Stop the lock-before-suspend service from hanging suspend.** Omarchy 4.0.2's
 `omarchy-sleep-lock.service` crash-loops (holding a sleep inhibitor) when the
 session is already locked, which blocks suspend indefinitely. Bound its restart
 loop so it fails fast and suspend proceeds:
